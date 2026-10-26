@@ -2,7 +2,7 @@
 Run:  pip install -r requirements.txt && uvicorn main:app --reload
 Optional: set ANTHROPIC_API_KEY to enable the AI tone/messaging layer (content is sent to Anthropic when on).
 """
-import os, re, json, sqlite3, time, urllib.request
+import os, re, json, sqlite3, time, base64, io, urllib.request
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -63,7 +63,7 @@ def lum(h):
     return .2126 * c[0] + .7152 * c[1] + .0722 * c[2]
 
 
-CLAIM = re.compile(r"[^.!?\n]*\b(guarantee\w*|double\w*|\d+x|#1|fastest|best|100%|risk-free)\b[^.!?\n]*", re.I)
+CLAIM = re.compile(r"[^.!?\n]*?\b(guarantee\w*|double\w*|\d+x|#1|fastest|best|100%|risk-free)\b[^.!?\n]*", re.I)
 
 
 def ai_review(text, guides):
@@ -90,7 +90,7 @@ def ai_review(text, guides):
     return res, "on"
 
 
-def review(text):
+def review(text, use_ai=True):
     srcs = q("SELECT * FROM sources WHERE active=1")
     by = lambda k: [s for s in srcs if s["kind"] == k]
     out = []
@@ -136,7 +136,7 @@ def review(text):
         if r < 4.5:
             out.append(dict(rule="accessibility", state="contradicted", span=m.group(0), src=None, quote="",
                             message=f"Contrast ratio {r:.1f}:1 is below the 4.5:1 WCAG AA minimum.", suggestion="Use a darker text or lighter background colour."))
-    ai, status = ai_review(text, by("guideline"))
+    ai, status = ai_review(text, by("guideline")) if use_ai else ([], "off")
     out += ai
     if status == "failed":
         out.append(dict(rule="system", state="not_assessed", span="", src=None, quote="",
@@ -284,6 +284,47 @@ def insights(x_user: str = Header("")):
             "audit": q("SELECT ts,who,action,detail FROM audit ORDER BY id DESC LIMIT 15")}
 
 
+class Up(BaseModel):
+    name: str; data: str
+
+
+@app.post("/api/extract")
+def extract(b: Up, x_user: str = Header("")):
+    need(x_user, "creator", "manager")
+    try:
+        raw = base64.b64decode(b.data)
+        if b.name.lower().endswith(".pdf"):
+            from pypdf import PdfReader
+            t = "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages)
+        else:
+            t = raw.decode("utf-8", "ignore")
+    except Exception:
+        raise HTTPException(400, "Could not read this file")
+    if not t.strip(): raise HTTPException(400, "No extractable text (scanned PDFs are not supported yet)")
+    return {"text": t[:20000]}
+
+
+EVAL = [("NovaDesk starts at INR 499/month.", set()), ("Meet Nova Desk today.", {"terminology"}),
+        ("Plans start at INR 299/month.", {"fact"}), ("We are the fastest tool.", {"claim"}),
+        ("Get 2x more leads.", {"claim"}), ("![](a.png) Welcome", {"accessibility"}),
+        ("[text:#aaaaaa on:#ffffff] Sale", {"accessibility"}), ("NovaDesk helps teams organise support.", set()),
+        ("Nova-Desk at INR 250/month, guaranteed results!", {"terminology", "fact", "claim"}),
+        ("Our customer saw revenue double in 90 days.", {"claim"}),
+        ("Start with NovaDesk at \u20b9499 per month.", set()), ("Rs. 1,200 per month with Novadesk", {"terminology", "fact"})]
+
+
+@app.get("/api/eval")
+def evaluate(x_user: str = Header("")):
+    who(x_user); rows = []; tp = fp = fn = 0
+    for text, exp in EVAL:
+        found = {f["rule"] for f in review(text, use_ai=False)[0]}
+        tp += len(found & exp); fp += len(found - exp); fn += len(exp - found)
+        rows.append({"text": text, "expected": sorted(exp), "found": sorted(found), "ok": found == exp})
+    return {"cases": rows, "correct": sum(r["ok"] for r in rows), "precision": round(tp / (tp + fp), 2) if tp + fp else 1.0,
+            "recall": round(tp / (tp + fn), 2) if tp + fn else 1.0,
+            "note": "Seeded regression suite (rule-level, AI off, default sources). It checks the deterministic engine; it is not a claim of real-world accuracy. Round 3 extends this to 30 labelled drafts."}
+
+
 # ---------------- UI ----------------
 HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BrandLess | Keep the message. Check the promise.</title><style>
@@ -307,16 +348,17 @@ let U=localStorage.u||'asha',CUR=null,FIX={};const $=s=>document.querySelector(s
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(p,m='GET',b){const r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json','X-User':U},body:b?JSON.stringify(b):undefined});const j=await r.json();if(!r.ok){alert(j.detail||'Error');throw 0}return j}
 const LBL={contradicted:'CONTRADICTED',not_verifiable:'NOT VERIFIABLE',conflict:'SOURCE CONFLICT',scope_check:'CHECK SCOPE',suggestion:'SUGGESTION',not_assessed:'NOT ASSESSED'};
+const SAMPLE2='Subject: Big news!\nHi team, NovaDesk is the best and fastest helpdesk, risk-free at Rs. 999 per month.\n![](banner.png)';
 const SAMPLE='Meet Nova Desk! Nova Desk starts at INR 299/month and every customer is guaranteed to double revenue in 7 days.\n\n![](hero.png)\n[text:#999999 on:#ffffff] Limited offer';
 async function boot(){const i=await api('/info');$('#u').innerHTML=Object.entries(i.users).map(([k,v])=>`<option value="${k}" ${k==U?'selected':''}>${esc(v)}</option>`).join('');
 $('#u').onchange=e=>{U=e.target.value;localStorage.u=U;CUR=null;tab('c')};
 $('#ft').textContent=i.ai=='on'?`AI disclosure: tone/messaging analysis sends draft text and guideline text to Anthropic (${i.model}). Exact checks run locally. AI findings are suggestions; humans decide.`:'AI disclosure: AI layer is OFF. All checks currently run locally with deterministic rules. Humans decide.';
-$('#nav').innerHTML=[['c','Content'],['s','Sources'],['i','Insights']].map(([k,t])=>`<button id="t${k}" onclick="tab('${k}')">${t}</button>`).join('');tab('c')}
-function tab(k){['c','s','i'].forEach(x=>$('#t'+x).classList.toggle('on',x==k));({c:content,s:srcs,i:ins})[k]()}
+$('#nav').innerHTML=[['c','Content'],['s','Sources'],['i','Insights'],['e','Evaluation']].map(([k,t])=>`<button id="t${k}" onclick="tab('${k}')">${t}</button>`).join('');tab('c')}
+function tab(k){['c','s','i','e'].forEach(x=>$('#t'+x).classList.toggle('on',x==k));({c:content,s:srcs,i:ins,e:evl})[k]()}
 async function content(){const l=await api('/contents');
 $('#m').innerHTML=`<div class="g"><div><button onclick="newForm()">+ New draft</button>${l.map(x=>`<div class="card item" onclick="openV(${x.vid})"><b>${esc(x.title)}</b><br><span class="mut">v${x.n} | ${x.status} | ${esc(x.author)}</span></div>`).join('')||'<p class="mut">Nothing here yet.</p>'}</div><div id="p"></div></div>`;
 CUR?openV(CUR):newForm()}
-function newForm(){CUR=null;$('#p').innerHTML=`<div class="card"><h3>Submit a draft for review</h3><input id="ti" placeholder="Title (e.g. Product launch post)"><input id="pu" placeholder="Purpose / audience (kept with the draft)"><textarea id="tx" placeholder="Paste your text here"></textarea><button onclick="$('#tx').value=SAMPLE;$('#ti').value='NovaDesk launch post';$('#pu').value='Announce to existing customers'">Load sample draft</button> <button onclick="create()">Run review</button><p class="mut">Checks: terminology, approved facts, promotional claims, tone (if AI on), alt text and contrast (write [text:#hex on:#hex]).</p></div>`}
+function newForm(){CUR=null;$('#p').innerHTML=`<div class="card"><h3>Submit a draft for review</h3><p class="mut"><b>Try it in 3 steps:</b> 1) Load a sample (or upload a PDF/TXT) and click Run review. 2) Respond to each finding. 3) Submit, then switch the Demo user (top right) to Rina to approve.</p><input id="ti" placeholder="Title (e.g. Product launch post)"><input id="pu" placeholder="Purpose / audience (kept with the draft)"><textarea id="tx" placeholder="Paste your text here"></textarea><button onclick="$('#tx').value=SAMPLE;$('#ti').value='NovaDesk launch post';$('#pu').value='Announce to existing customers'">Load sample draft</button> <button onclick="$('#tx').value=SAMPLE2;$('#ti').value='Launch email';$('#pu').value='Email to leads'">Load email sample</button> <input type="file" id="fl" accept=".pdf,.txt,.md" onchange="upl(this)" style="width:auto"> <button onclick="create()">Run review</button><p class="mut">Checks: terminology, approved facts, promotional claims, tone (if AI on), alt text and contrast (write [text:#hex on:#hex]).</p></div>`}
 async function create(){const r=await api('/contents','POST',{title:$('#ti').value,purpose:$('#pu').value,text:$('#tx').value});CUR=r.vid;content()}
 async function openV(id){CUR=id;const d=await api('/versions/'+id),v=d.version,me=U,mine=v.cauthor==me,ed=mine&&['draft','changes_requested'].includes(v.status);FIX={};
 const rev=!mine&&v.status=='in_review'&&U!='asha';
@@ -344,6 +386,8 @@ async function addS(){await api('/sources','POST',{kind:$('#k').value,title:$('#
 async function ins(){const d=await api('/insights');$('#m').innerHTML=`<h3>Governance insights</h3><div class="card"><b>Findings by rule type</b><table>${d.by_rule.map(r=>`<tr><td>${r.rule}</td><td>${r.n}</td></tr>`).join('')||'<tr><td>No data yet</td></tr>'}</table></div>
 <div class="card"><b>Possibly unclear guidelines</b> <span class="mut">(findings creators disputed or rejected; a manager decides whether to clarify)</span><table>${d.disputed.map(r=>`<tr><td>${r.rule}</td><td>${esc(r.source||'no source')}</td><td>${r.n}</td></tr>`).join('')||'<tr><td>None yet</td></tr>'}</table></div>
 <div class="card"><b>Audit trail (latest)</b><table>${d.audit.map(a=>`<tr><td>${new Date(a.ts*1000).toLocaleTimeString()}</td><td>${esc(a.who)}</td><td>${a.action}</td><td>${esc(a.detail)}</td></tr>`).join('')}</table></div>`}
+function upl(i){const f=i.files[0];if(!f)return;const r=new FileReader();r.onload=async()=>{const j=await api('/extract','POST',{name:f.name,data:r.result.split(',')[1]});$('#tx').value=j.text;if(!$('#ti').value)$('#ti').value=f.name};r.readAsDataURL(f)}
+async function evl(){const d=await api('/eval');$('#m').innerHTML=`<h3>Built-in evaluation</h3><p class="mut">${esc(d.note)}</p><div class="card">Cases: ${d.cases.length} | Fully correct: ${d.correct} | Precision ${d.precision} | Recall ${d.recall}</div><table><tr><th>Draft</th><th>Expected</th><th>Found</th><th>Result</th></tr>${d.cases.map(c=>`<tr><td>${esc(c.text)}</td><td>${esc(c.expected.join(', ')||'none')}</td><td>${esc(c.found.join(', ')||'none')}</td><td>${c.ok?'PASS':'FAIL'}</td></tr>`).join('')}</table>`}
 boot();
 </script></body></html>"""
 
