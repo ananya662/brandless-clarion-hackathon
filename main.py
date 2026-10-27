@@ -37,6 +37,8 @@ def init():
     q("""CREATE TABLE IF NOT EXISTS contents(id INTEGER PRIMARY KEY, title TEXT, purpose TEXT, author TEXT)""", w=True)
     q("""CREATE TABLE IF NOT EXISTS versions(id INTEGER PRIMARY KEY, content_id INT, n INT, text TEXT, author TEXT, status TEXT DEFAULT 'draft', approved_by TEXT, note TEXT, ai TEXT)""", w=True)
     q("""CREATE TABLE IF NOT EXISTS findings(id INTEGER PRIMARY KEY, version_id INT, rule TEXT, state TEXT, span TEXT, message TEXT, source_id INT, source_version INT, quote TEXT, suggestion TEXT, fix TEXT, decision TEXT DEFAULT 'open', reason TEXT)""", w=True)
+    try: q("ALTER TABLE findings ADD COLUMN occurrences INT DEFAULT 1", w=True)
+    except sqlite3.OperationalError: pass
     q("""CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY, version_id INT, who TEXT, text TEXT)""", w=True)
     q("""CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, who TEXT, action TEXT, detail TEXT)""", w=True)
     if not q("SELECT 1 FROM sources LIMIT 1", one=True):
@@ -170,11 +172,16 @@ def review(text, use_ai=True):
 def run(vid, text):
     res, status = review(text)
     q("UPDATE versions SET ai=? WHERE id=?", (status, vid), w=True)
+    groups = {}  # identical finding (same rule/span/source/fix) -> one card with an occurrence count
     for f in res:
+        k = (f["rule"], f["state"], f["span"], (f.get("src") or {}).get("id"), f.get("fix"), f["message"])
+        if k in groups: groups[k][1] += 1
+        else: groups[k] = [f, 1]
+    for f, n in groups.values():
         s = f.get("src") or {}
         sug = f.get("suggestion") or (f"Replace \u201c{f['span']}\u201d with \u201c{f['fix']}\u201d" if f.get("fix") else "")
-        q("INSERT INTO findings(version_id,rule,state,span,message,source_id,source_version,quote,suggestion,fix) VALUES(?,?,?,?,?,?,?,?,?,?)",
-          (vid, f["rule"], f["state"], f["span"], f["message"], s.get("id"), s.get("version"), f["quote"], sug, f.get("fix")), w=True)
+        q("INSERT INTO findings(version_id,rule,state,span,message,source_id,source_version,quote,suggestion,fix,occurrences) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+          (vid, f["rule"], f["state"], f["span"], f["message"], s.get("id"), s.get("version"), f["quote"], sug, f.get("fix"), n), w=True)
 
 
 # ---------------- API ----------------
@@ -237,6 +244,10 @@ def new_content(b: New, x_user: str = Header("")):
     run(vid, b.text); log(u, "content_created", f"v{vid}"); return {"vid": vid}
 
 
+def latest(v):
+    return q("SELECT id,n FROM versions WHERE content_id=? ORDER BY n DESC LIMIT 1", (v["content_id"],), one=True)
+
+
 def ver(vid):
     v = q("SELECT v.*,c.title,c.purpose,c.author cauthor FROM versions v JOIN contents c ON c.id=v.content_id WHERE v.id=?", (vid,), one=True)
     if not v: raise HTTPException(404, "Not found")
@@ -245,8 +256,8 @@ def ver(vid):
 
 @app.get("/api/versions/{vid}")
 def get_version(vid: int, x_user: str = Header("")):
-    who(x_user); v = ver(vid)
-    return {"version": v, "findings": q("SELECT * FROM findings WHERE version_id=?", (vid,)),
+    who(x_user); v = ver(vid); lt = latest(v)
+    return {"version": v, "latest": lt["id"] == vid, "latest_id": lt["id"], "latest_n": lt["n"], "findings": q("SELECT * FROM findings WHERE version_id=?", (vid,)),
             "comments": q("SELECT * FROM comments WHERE version_id=?", (vid,)),
             "history": q("SELECT id,n,status,approved_by FROM versions WHERE content_id=? ORDER BY n", (v["content_id"],)),
             "src": {s["id"]: s["title"] for s in q("SELECT id,title FROM sources")}}
@@ -256,6 +267,9 @@ def get_version(vid: int, x_user: str = Header("")):
 def revise(vid: int, b: Txt, x_user: str = Header("")):
     u = need(x_user, "creator", "manager"); v = ver(vid)
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can revise")
+    lt = latest(v)
+    if lt["id"] != vid: raise HTTPException(409, f"A newer version (v{lt['n']}) exists. Open the latest version to edit.")
+    if b.text.strip() == v["text"].strip(): raise HTTPException(400, "No changes to save. Edit the text or apply a suggestion first.")
     n = q("SELECT MAX(n) m FROM versions WHERE content_id=?", (v["content_id"],), one=True)["m"] + 1
     nid = q("INSERT INTO versions(content_id,n,text,author) VALUES(?,?,?,?)", (v["content_id"], n, b.text, u), w=True)
     run(nid, b.text); log(u, "revised", f"v{n} of content {v['content_id']}"); return {"vid": nid}
@@ -266,6 +280,7 @@ def decide(fid: int, b: Dec, x_user: str = Header("")):
     u = need(x_user, "creator", "manager")
     f = q("SELECT * FROM findings WHERE id=?", (fid,), one=True); v = ver(f["version_id"])
     if v["cauthor"] != u or v["status"] not in ("draft", "changes_requested"): raise HTTPException(403, "Not allowed on this version")
+    if latest(v)["id"] != v["id"]: raise HTTPException(409, "This is an older version; respond on the latest version.")
     if b.decision not in ("accept", "reject", "dispute"): raise HTTPException(400, "Bad decision")
     if b.decision != "accept" and not b.reason.strip(): raise HTTPException(400, "A reason is required")
     q("UPDATE findings SET decision=?,reason=? WHERE id=?", (b.decision, b.reason, fid), w=True)
@@ -276,6 +291,7 @@ def decide(fid: int, b: Dec, x_user: str = Header("")):
 def submit(vid: int, x_user: str = Header("")):
     u = need(x_user, "creator", "manager"); v = ver(vid)
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can submit")
+    if latest(v)["id"] != vid: raise HTTPException(409, "Only the latest version can be submitted.")
     q("UPDATE versions SET status='in_review' WHERE id=?", (vid,), w=True); log(u, "submitted", str(vid)); return {"ok": True}
 
 
@@ -407,7 +423,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--li
 <section class="hero"><div><h1>Keep the message. Check the promise.</h1><p>BrandLess reviews content against approved brand facts and guidelines before publication, explains every finding with its source, and leaves the decision to people.</p><div class="steps"><span>1 Approve sources</span><span>2 Review draft</span><span>3 Resolve findings</span><span>4 Human approval</span><span>5 Learn from disputes</span></div></div></section>
 <main id="m"></main><footer id="ft"></footer>
 <script>
-let U=localStorage.u||'asha',CUR=null,FIX={};const $=s=>document.querySelector(s);
+let U=localStorage.u||'asha',CUR=null,FIX={},DRAFT={},SAVED={};const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(p,m='GET',b){const r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json','X-User':U},body:b?JSON.stringify(b):undefined});const j=await r.json();if(!r.ok){alert(j.detail||'Error');throw 0}return j}
 const LBL={contradicted:'CONTRADICTED',not_verifiable:'NOT VERIFIABLE',conflict:'SOURCE CONFLICT',scope_check:'CHECK SCOPE',suggestion:'SUGGESTION',not_assessed:'NOT ASSESSED'};
@@ -423,22 +439,24 @@ $('#m').innerHTML=`<div class="g"><div><button onclick="newForm()">+ New draft</
 CUR?openV(CUR):newForm()}
 function newForm(){CUR=null;$('#p').innerHTML=`<div class="card"><h3>Submit a draft for review</h3><p class="mut"><b>Try it in 3 steps:</b> 1) Load a sample (or upload a PDF/TXT) and click Run review. 2) Respond to each finding. 3) Submit, then switch the Demo user (top right) to Rina to approve.</p><input id="ti" placeholder="Title (e.g. Product launch post)"><input id="pu" placeholder="Purpose / audience (kept with the draft)"><textarea id="tx" placeholder="Paste your text here"></textarea><button onclick="$('#tx').value=SAMPLE;$('#ti').value='NovaDesk launch post';$('#pu').value='Announce to existing customers'">Load sample draft</button> <button onclick="$('#tx').value=SAMPLE2;$('#ti').value='Launch email';$('#pu').value='Email to leads'">Load email sample</button> <input type="file" id="fl" accept=".pdf,.docx,.txt,.md,.png,.jpg,.jpeg" onchange="upl(this)" style="width:auto"> <button onclick="create()">Run review</button><p class="mut">Checks: terminology, approved facts, promotional claims, tone (if AI on), alt text and contrast (write [text:#hex on:#hex]).</p></div>`}
 async function create(){const r=await api('/contents','POST',{title:$('#ti').value,purpose:$('#pu').value,text:$('#tx').value});CUR=r.vid;content()}
-async function openV(id){CUR=id;const d=await api('/versions/'+id),v=d.version,me=U,mine=v.cauthor==me,ed=mine&&['draft','changes_requested'].includes(v.status);FIX={};const df=v.n>1?await api('/versions/'+id+'/diff'):null;
+async function openV(id){CUR=id;const d=await api('/versions/'+id),v=d.version,me=U,mine=v.cauthor==me,ed=mine&&d.latest&&['draft','changes_requested'].includes(v.status);FIX={};SAVED[id]=v.text;const df=v.n>1?await api('/versions/'+id+'/diff'):null;
 const rev=!mine&&v.status=='in_review'&&U!='asha';
 $('#p').innerHTML=`<div class="card"><h3>${esc(v.title)} <span class="badge">v${v.n}: ${v.status.toUpperCase()}</span></h3><div class="mut">Purpose: ${esc(v.purpose)||'-'} | Author: ${esc(v.cauthor)} | AI layer: ${v.ai} ${v.approved_by?'| Approved by '+esc(v.approved_by):''} ${v.note?'| Note: '+esc(v.note):''}</div>
 <div class="mut">Versions: ${d.history.map(h=>`<a href="#" onclick="openV(${h.id});return false">v${h.n} (${h.status})</a>`).join(' | ')}</div>
-<textarea id="ed" ${ed?'':'readonly'}>${esc(v.text)}</textarea>${v.status=='approved'?`<button onclick="rec(${id})">Download approval record</button>`:''}
+${d.latest?'':`<div class="card"><b>Older version (read-only).</b> The latest is v${d.latest_n}. <a href="#" onclick="openV(${d.latest_id});return false">Open latest</a></div>`}<textarea id="ed" ${ed?'':'readonly'} oninput="DRAFT[${id}]=this.value;mark(${id})">${esc(ed&&DRAFT[id]!==undefined?DRAFT[id]:v.text)}</textarea><div id="uns" class="mut" style="color:#b54708">${ed&&DRAFT[id]!==undefined&&DRAFT[id]!==v.text?'Unsaved changes: click "Save as new version and re-run review" to check them.':''}</div>${v.status=='approved'?`<button onclick="rec(${id})">Download approval record</button>`:''}
 ${ed?`<button onclick="saveV(${id})">Save as new version and re-run review</button> <button onclick="api('/versions/${id}/submit','POST').then(()=>openV(${id}))">Submit for approval</button>`:''}</div>
-${df&&df.ops.length?`<div class="card"><b>Changes since v${df.prev}</b><br>${df.ops.map(o=>o[0]=='='?esc(o[1]):o[0]=='-'?'<del>'+esc(o[1])+'</del>':'<ins>'+esc(o[1])+'</ins>').join(' ')}</div>`:''}<h4>Findings (${d.findings.length})</h4>${d.findings.map(f=>{if(f.fix)FIX[f.id]=f;return`<div class="card"><span class="badge s-${f.state}">${LBL[f.state]}</span> <i>${f.rule}</i> ${f.span?'<code>'+esc(f.span)+'</code>':''}<p>${esc(f.message)}</p>
+${df&&df.ops.length?`<div class="card"><b>Changes since v${df.prev}</b><br>${df.ops.map(o=>o[0]=='='?esc(o[1]):o[0]=='-'?'<del>'+esc(o[1])+'</del>':'<ins>'+esc(o[1])+'</ins>').join(' ')}</div>`:''}<h4>Findings (${d.findings.length})</h4>${d.findings.map(f=>{if(f.fix)FIX[f.id]=f;return`<div class="card"><span class="badge s-${f.state}">${LBL[f.state]}</span> <i>${f.rule}</i> ${f.occurrences>1?'<b>('+f.occurrences+' occurrences)</b> ':''}${f.span?'<code>'+esc(f.span)+'</code>':''}<p>${esc(f.message)}</p>
 ${f.quote?`<blockquote>Source: ${esc(d.src[f.source_id]||'')} (v${f.source_version}): ${esc(f.quote)}</blockquote>`:''}${f.suggestion?`<div>Suggestion: ${esc(f.suggestion)}</div>`:''}
 <div class="mut">Creator decision: <b>${f.decision}</b> ${esc(f.reason)}</div>
 ${ed?`${f.fix?`<button onclick="apply(${f.id})">Apply suggestion to text</button> `:''}<button onclick="dec(${f.id},'accept')">Accept</button> <button onclick="dec(${f.id},'dispute')">Dispute</button> <button onclick="dec(${f.id},'reject')">Reject</button>`:''}</div>`}).join('')||'<p>No issues found.</p>'}
 <h4>Discussion</h4>${d.comments.map(c=>`<div class="card"><b>${esc(c.who)}</b>: ${esc(c.text)}</div>`).join('')}
 <input id="cm" placeholder="Add a comment"><button onclick="cmt(${id})">Comment</button>
 ${rev?`<div class="card"><b>Reviewer decision</b><input id="nt" placeholder="Note (required if the creator disputed any finding)"><button onclick="appr(${id},true)">Approve this version</button> <button onclick="appr(${id},false)">Request changes</button></div>`:''}`}
-function apply(id){const f=FIX[id],t=$('#ed');if(!t.value.includes(f.span))return alert('Text already changed');t.value=t.value.replace(f.span,f.fix)}
+function applyAll(text,span,fix){const e=span.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');return text.replace(new RegExp((/^\w/.test(span)?'(?<!\\w)':'')+e+(/\w$/.test(span)?'(?!\\w)':''),'g'),()=>fix)}
+function mark(id){const u=$('#uns');if(u)u.textContent=DRAFT[id]!==undefined&&DRAFT[id]!==SAVED[id]?'Unsaved changes: click "Save as new version and re-run review" to check them.':''}
+function apply(id){const f=FIX[id],t=$('#ed'),n=applyAll(t.value,f.span,f.fix);if(n===t.value)return alert('That text is no longer in the editor.');t.value=n;DRAFT[CUR]=n;mark(CUR)}
 async function dec(id,d){let r='';if(d!='accept'){r=prompt('Reason (required):');if(!r)return}await api('/findings/'+id+'/decide','POST',{decision:d,reason:r});openV(CUR)}
-async function saveV(id){const r=await api('/versions/'+id+'/revise','POST',{text:$('#ed').value});CUR=r.vid;content()}
+async function saveV(id){const r=await api('/versions/'+id+'/revise','POST',{text:$('#ed').value});delete DRAFT[id];CUR=r.vid;content()}
 async function cmt(id){if(!$('#cm').value)return;await api('/versions/'+id+'/comment','POST',{text:$('#cm').value});openV(id)}
 async function appr(id,a){await api('/versions/'+id+'/approve','POST',{approve:a,note:$('#nt').value});openV(id)}
 async function srcs(){const l=await api('/sources');$('#m').innerHTML=`<p class="mut">Approved source library. Only the Manager can add or switch sources. Switching creates a new source version; past reviews keep the version they used.</p>
