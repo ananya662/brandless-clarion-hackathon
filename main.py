@@ -292,6 +292,8 @@ def submit(vid: int, x_user: str = Header("")):
     u = need(x_user, "creator", "manager"); v = ver(vid)
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can submit")
     if latest(v)["id"] != vid: raise HTTPException(409, "Only the latest version can be submitted.")
+    n = sum(1 for f in q("SELECT state,decision FROM findings WHERE version_id=?", (vid,)) if f["decision"] == "open" and f["state"] != "suggestion")
+    if n: raise HTTPException(400, f"Respond to {n} finding(s) before submitting: accept, dispute or reject each one, or fix the text and save a new version.")
     q("UPDATE versions SET status='in_review' WHERE id=?", (vid,), w=True); log(u, "submitted", str(vid)); return {"ok": True}
 
 
