@@ -42,6 +42,9 @@ def init():
     try: q("ALTER TABLE findings ADD COLUMN occurrences INT DEFAULT 1", w=True)
     except sqlite3.OperationalError: pass
     q("""CREATE TABLE IF NOT EXISTS proposals(id INTEGER PRIMARY KEY, doc TEXT, kind TEXT, title TEXT, body TEXT, pattern TEXT, value TEXT, passage TEXT, flag TEXT, status TEXT DEFAULT 'pending', source_id INT)""", w=True)
+    for col in ("support TEXT", "support_note TEXT", "needs_review INT DEFAULT 0"):
+        try: q("ALTER TABLE findings ADD COLUMN " + col, w=True)
+        except sqlite3.OperationalError: pass
     for col in ("passage TEXT", "origin TEXT"):
         try: q("ALTER TABLE sources ADD COLUMN " + col, w=True)
         except sqlite3.OperationalError: pass
@@ -94,7 +97,7 @@ def lum(h):
     return .2126 * c[0] + .7152 * c[1] + .0722 * c[2]
 
 
-CLAIM = re.compile(r"[^.!?\n]*?\b(guarantee\w*|double\w*|\d+x|#1|fastest|best|100%|risk-free)\b[^.!?\n]*", re.I)
+CLAIM = re.compile(r"[^.!?\n]*?(?<!\w)(guarantee\w*|double\w*|\d+x|#1|fastest|best(?!\s+practice)|100%|risk-free)(?!\w)[^.!?\n]*", re.I)
 
 
 def mask(t):
@@ -192,8 +195,49 @@ def review(text, use_ai=True):
     return out, status
 
 
+UNIV = re.compile(r"\b(every|all|always|any|everyone|guarantee\w*|100%|never)\b", re.I)
+LIMITED = re.compile(r"\b(single|one customer|a customer|case study|example|some)\b", re.I)
+NUM = re.compile(r"\d[\d,]*")
+_rgb = lambda x: [int(x[i:i + 2], 16) for i in (1, 3, 5)]
+
+
+def support(f):
+    """Second check: does the CITED passage really back this finding? -> (verified|partial|unsupported|n/a, note)"""
+    s, r, st = f.get("src"), f["rule"], f["state"]
+    if r == "terminology" and s:
+        ok = f["span"] in (s["value"] or "").split("|") and bool(s["title"]) and f.get("fix") == s["title"]
+        return ("verified", "The cited term source lists this wording as banned and names the preferred form.") if ok else ("unsupported", "The cited source does not list this wording as banned with that preferred name.")
+    if r == "fact" and st == "conflict" and s:
+        vals = {x["value"] for x in q("SELECT value FROM sources WHERE active=1 AND kind='fact' AND pattern=?", (s["pattern"],))}
+        return ("verified", "Two active sources give different values: " + ", ".join(sorted(vals)) + ".") if len(vals) > 1 else ("unsupported", "Only one value exists for this pattern, so there is no conflict.")
+    if r == "fact" and s:
+        nums = {n.replace(",", "") for n in NUM.findall(s["body"] or "")}
+        return ("verified", f"The cited passage states the approved value {s['value']}.") if s["value"] in nums else ("unsupported", f"The cited passage does not mention the approved value {s['value']}. Ask the manager to fix the source text.")
+    if r == "claim" and st == "scope_check" and s:
+        cn = {n.replace(",", "") for n in NUM.findall(f["span"])}; en = {n.replace(",", "") for n in NUM.findall(s["body"] or "")}
+        if UNIV.search(f["span"]) and LIMITED.search(s["body"] or ""): return "partial", "The evidence describes a limited case, but the claim is universal."
+        if cn - en: return "partial", "Numbers in the claim (" + ", ".join(sorted(cn - en)) + ") do not appear in the evidence."
+        return "verified", "The evidence covers the claim as worded."
+    if r == "claim": return "n/a", "No approved source mentions this claim. Absence of evidence is not proof it is false."
+    if r == "visual" and s:
+        pal = [p for p in (s["value"] or "").split("|") if re.fullmatch(r"#[0-9a-fA-F]{6}", p)]
+        d = min((sum((u - w) ** 2 for u, w in zip(_rgb(f["span"]), _rgb(c))) ** .5 for c in pal), default=999)
+        return ("verified", f"The colour is {d:.0f} away from the nearest approved palette colour.") if d > 80 else ("unsupported", "The colour is close to an approved palette colour.")
+    if r == "tone": return "verified", "The quoted guideline text was confirmed in the source."
+    return "n/a", "Computed directly from the draft; no source passage is needed."
+
+
+def assess(res):
+    for f in res:
+        st, note = support(f)
+        f["support"], f["support_note"], f["needs_review"] = st, note, int(st in ("partial", "unsupported"))
+        if st == "unsupported" and f["state"] in ("contradicted", "conflict"):  # never present an unbacked finding as a violation
+            f["state"] = "suggestion"; f["message"] = "Unverified (the cited source does not back this up): " + f["message"]
+    return res
+
+
 def run(vid, text):
-    res, status = review(text)
+    res, status = review(text); assess(res)
     q("UPDATE versions SET ai=? WHERE id=?", (status, vid), w=True)
     groups = {}  # identical finding (same rule/span/source/fix) -> one card with an occurrence count
     for f in res:
@@ -203,8 +247,8 @@ def run(vid, text):
     for f, n in groups.values():
         s = f.get("src") or {}
         sug = f.get("suggestion") or (f"Replace \u201c{f['span']}\u201d with \u201c{f['fix']}\u201d" if f.get("fix") else "")
-        q("INSERT INTO findings(version_id,rule,state,span,message,source_id,source_version,quote,suggestion,fix,occurrences) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-          (vid, f["rule"], f["state"], f["span"], f["message"], s.get("id"), s.get("version"), f["quote"], sug, f.get("fix"), n), w=True)
+        q("INSERT INTO findings(version_id,rule,state,span,message,source_id,source_version,quote,suggestion,fix,occurrences,support,support_note,needs_review) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          (vid, f["rule"], f["state"], f["span"], f["message"], s.get("id"), s.get("version"), f["quote"], sug, f.get("fix"), n, f.get("support"), f.get("support_note"), f.get("needs_review", 0)), w=True)
 
 
 # ---------------- API ----------------
@@ -513,6 +557,7 @@ def approve(vid: int, b: Ap, x_token: str = Header("")):
         open_ = [f for f in fs if f["decision"] == "open" and f["state"] != "suggestion"]
         if open_: raise HTTPException(400, f"{len(open_)} finding(s) still have no creator response")
         if any(f["decision"] == "dispute" for f in fs) and not b.note.strip(): raise HTTPException(400, "Add a note explaining how disputes were resolved")
+        if any(f["needs_review"] for f in fs) and not b.note.strip(): raise HTTPException(400, "Some findings are marked NEEDS HUMAN CHECK (the evidence only partly supports them). Add a note on how you checked them.")
     q("UPDATE versions SET status=?,approved_by=?,note=? WHERE id=?", ("approved" if b.approve else "changes_requested", u if b.approve else None, b.note, vid), w=True)
     log(u, "approved" if b.approve else "changes_requested", f"v{vid}: {b.note}"); return {"ok": True}
 
@@ -577,26 +622,60 @@ def extract(b: Up, x_token: str = Header("")):
     return {"text": t[:20000]}
 
 
-EVAL = [("NovaDesk starts at INR 499/month.", set()), ("Meet Nova Desk today.", {"terminology"}),
-        ("Plans start at INR 299/month.", {"fact"}), ("We are the fastest tool.", {"claim"}),
-        ("Get 2x more leads.", {"claim"}), ("![](a.png) Welcome", {"accessibility"}),
-        ("[text:#aaaaaa on:#ffffff] Sale", {"accessibility"}), ("NovaDesk helps teams organise support.", set()),
-        ("Nova-Desk at INR 250/month, guaranteed results!", {"terminology", "fact", "claim"}),
-        ("Our customer saw revenue double in 90 days.", {"claim"}),
-        ("Start with NovaDesk at \u20b9499 per month.", set()), ("Rs. 1,200 per month with Novadesk", {"terminology", "fact"}),
-        ("[colors: #FF00FF] banner", {"visual"}), ("![logo](l.png) [colors: #2F6FED, #FFFFFF]", set()), ("See [click here](x) for plans", {"accessibility"})]
+C, S, U = "clean", "seeded error", "unsupported/ambiguous claim"
+T, F, A, V = ("terminology", "contradicted"), ("fact", "contradicted"), ("accessibility", "contradicted"), ("visual", "contradicted")
+NV, SC = ("claim", "not_verifiable"), ("claim", "scope_check")
+EVAL = [  # labels were written from the written rules BEFORE running the engine; (group, draft, expected findings, expected evidence-check results)
+    (C, "NovaDesk starts at INR 499/month.", set(), None),
+    (C, "NovaDesk helps support teams answer customers faster.", set(), None),
+    (C, "Join our webinar on Friday at 5 PM to see NovaDesk in action.", set(), None),
+    (C, "![NovaDesk dashboard](dash.png) Meet the new inbox.", set(), None),
+    (C, "Start with NovaDesk at \u20b9499 per month.", set(), None),
+    (C, "[text:#1F2A44 on:#FFFFFF] Welcome to NovaDesk", set(), None),
+    (C, "[colors: #2F6FED, #FFFFFF] banner for the NovaDesk launch", set(), None),
+    (C, "Read the [pricing guide](https://example.com/pricing) before you choose a plan.", set(), None),
+    (C, "NovaDesk was founded to make customer support simpler.", set(), None),
+    (C, "Our best practices guide is available to customers.", set(), None),
+    (S, "Meet Nova Desk today.", {T}, {"terminology": "verified"}),
+    (S, "Plans start at INR 299/month.", {F}, {"fact": "verified"}),
+    (S, "Try Novadesk free.", {T}, None),
+    (S, "Only Rs. 1,200 per month.", {F}, None),
+    (S, "![](banner.png) Launch day", {A}, None),
+    (S, "[text:#aaaaaa on:#ffffff] Sale", {A}, None),
+    (S, "[colors: #FF00FF] hero banner", {V}, None),
+    (S, "See [click here](https://example.com) for plans", {A}, None),
+    (S, "Nova-Desk at INR 250/month", {T, F}, None),
+    (S, "Nova Desk, only \u20b9 99 this week", {T, F}, None),
+    (U, "We are the fastest tool.", {NV}, None),
+    (U, "Get 2x more leads.", {NV}, None),
+    (U, "Guaranteed results in 7 days.", {NV}, None),
+    (U, "NovaDesk is risk-free.", {NV}, None),
+    (U, "Our customer saw revenue double in 90 days.", {SC}, {"claim": "verified"}),
+    (U, "Every customer will double revenue in 90 days.", {SC}, {"claim": "partial"}),
+    (U, "100% satisfaction, no questions asked.", {NV}, None),
+    (U, "The best helpdesk in India.", {NV}, None),
+    (U, "Customers see twice the revenue.", {NV}, None),
+    (U, "NovaDesk guarantees uptime.", {NV}, None),
+]
 
 
 @app.get("/api/eval")
 def evaluate(x_token: str = Header("")):
-    who(x_token); rows = []; tp = fp = fn = 0
-    for text, exp in EVAL:
-        found = {f["rule"] for f in review(text, use_ai=False)[0]}
+    who(x_token); rows = []; tp = fp = fn = sc = sk = cfp = 0
+    for group, text, exp, sup in EVAL:
+        res = assess(review(text, use_ai=False)[0])
+        found = {(f["rule"], f["state"]) for f in res}
         tp += len(found & exp); fp += len(found - exp); fn += len(exp - found)
-        rows.append({"text": text, "expected": sorted(exp), "found": sorted(found), "ok": found == exp})
-    return {"cases": rows, "correct": sum(r["ok"] for r in rows), "precision": round(tp / (tp + fp), 2) if tp + fp else 1.0,
-            "recall": round(tp / (tp + fn), 2) if tp + fn else 1.0,
-            "note": "Seeded regression suite (rule-level, AI off, default sources). It checks the deterministic engine; it is not a claim of real-world accuracy. Round 3 extends this to 30 labelled drafts."}
+        if group == C and found: cfp += 1
+        sok = None
+        if sup:
+            sk += 1; sok = all(any(f["rule"] == r and f["support"] == v for f in res) for r, v in sup.items()); sc += int(sok)
+        rows.append({"group": group, "text": text, "expected": sorted(f"{r}:{t}" for r, t in exp), "found": sorted(f"{r}:{t}" for r, t in found),
+                     "ok": found == exp and sok is not False, "support_ok": sok})
+    return {"cases": rows, "total": len(rows), "correct": sum(r["ok"] for r in rows), "groups": {g: sum(1 for e in EVAL if e[0] == g) for g in (C, S, U)},
+            "precision": round(tp / (tp + fp), 2) if tp + fp else 1.0, "recall": round(tp / (tp + fn), 2) if tp + fn else 1.0,
+            "clean_false_positives": cfp, "support_checked": sk, "support_correct": sc,
+            "note": "30 fictional drafts (10 clean, 10 seeded errors, 10 unsupported or ambiguous claims) run through the rule engine with AI off against the active source library. Labels were written before running. Small, developer-written set: it shows where the engine is reliable and where it is not, not real-world accuracy. Misses are listed, not hidden."}
 
 
 # ---------------- UI ----------------
@@ -664,7 +743,7 @@ $('#p').innerHTML=`<div class="card"><h3>${esc(v.title)} <span class="badge">v${
 ${d.latest?'':`<div class="card"><b>Older version (read-only).</b> The latest is v${d.latest_n}. <a href="#" onclick="openV(${d.latest_id});return false">Open latest</a></div>`}<textarea id="ed" ${ed?'':'readonly'} oninput="DRAFT[${id}]=this.value;mark(${id})">${esc(ed&&DRAFT[id]!==undefined?DRAFT[id]:v.text)}</textarea><div id="uns" class="mut" style="color:#b54708">${ed&&DRAFT[id]!==undefined&&DRAFT[id]!==v.text?'Unsaved changes: click "Save as new version and re-run review" to check them.':''}</div>${v.status=='approved'?`<button onclick="rec(${id})">Download approval record</button>`:''}${(mine||ME.role=='manager')?`<button onclick="delC(${v.content_id})">Delete draft</button>`:''}
 ${ed?`<button onclick="saveV(${id})">Save as new version and re-run review</button> <button onclick="api('/versions/${id}/submit','POST').then(()=>openV(${id}))">Submit for approval</button>`:''}</div>
 ${df&&df.ops.length?`<div class="card"><b>Changes since v${df.prev}</b><br>${df.ops.map(o=>o[0]=='='?esc(o[1]):o[0]=='-'?'<del>'+esc(o[1])+'</del>':'<ins>'+esc(o[1])+'</ins>').join(' ')}</div>`:''}<h4>Findings (${d.findings.length})</h4>${d.findings.map(f=>{if(f.fix)FIX[f.id]=f;return`<div class="card"><span class="badge s-${f.state}">${LBL[f.state]}</span> <i>${f.rule}</i> ${f.occurrences>1?'<b>('+f.occurrences+' occurrences)</b> ':''}${f.span?'<code>'+esc(f.span)+'</code>':''}<p>${esc(f.message)}</p>
-${f.quote?`<blockquote>Source: ${esc(d.src[f.source_id]||'')} (v${f.source_version}): ${esc(f.quote)}</blockquote>`:''}${f.suggestion?`<div>Suggestion: ${esc(f.suggestion)}</div>`:''}
+${f.quote?`<blockquote>Source: ${esc(d.src[f.source_id]||'')} (v${f.source_version}): ${esc(f.quote)}</blockquote>`:''}${f.suggestion?`<div>Suggestion: ${esc(f.suggestion)}</div>`:''}${f.support&&f.support!='n/a'?`<div class="mut">Evidence check: <b>${f.support.toUpperCase()}</b>${f.needs_review?' <span class="badge">NEEDS HUMAN CHECK</span>':''} ${esc(f.support_note)}</div>`:''}
 <div class="mut">Creator decision: <b>${f.decision}</b> ${esc(f.reason)}</div>
 ${ed?`${f.fix?`<button onclick="apply(${f.id})">Apply suggestion to text</button> `:''}<button onclick="dec(${f.id},'accept')">Accept</button> <button onclick="dec(${f.id},'dispute')">Dispute</button> <button onclick="dec(${f.id},'reject')">Reject</button>`:''}</div>`}).join('')||'<p>No issues found.</p>'}
 <h4>Discussion</h4>${d.comments.map(c=>`<div class="card"><b>${esc(c.who)}</b>: ${esc(c.text)}</div>`).join('')}
@@ -687,7 +766,7 @@ async function ins(){const d=await api('/insights');$('#m').innerHTML=`<h3>Gover
 <div class="card"><b>Audit trail (latest)</b><table>${d.audit.map(a=>`<tr><td>${new Date(a.ts*1000).toLocaleTimeString()}</td><td>${esc(a.who)}</td><td>${a.action}</td><td>${esc(a.detail)}</td></tr>`).join('')}</table></div>`}
 async function rec(id){const j=await api('/versions/'+id+'/record');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(j,null,2)],{type:'application/json'}));a.download='approval-record-v'+id+'.json';a.click()}
 function upl(i){const f=i.files[0];if(!f)return;const r=new FileReader();r.onload=async()=>{const j=await api('/extract','POST',{name:f.name,data:r.result.split(',')[1]});$('#tx').value=j.text;if(!$('#ti').value)$('#ti').value=f.name};r.readAsDataURL(f)}
-async function evl(){const d=await api('/eval');$('#m').innerHTML=`<h3>Built-in evaluation</h3><p class="mut">${esc(d.note)}</p><div class="card">Cases: ${d.cases.length} | Fully correct: ${d.correct} | Precision ${d.precision} | Recall ${d.recall}</div><table><tr><th>Draft</th><th>Expected</th><th>Found</th><th>Result</th></tr>${d.cases.map(c=>`<tr><td>${esc(c.text)}</td><td>${esc(c.expected.join(', ')||'none')}</td><td>${esc(c.found.join(', ')||'none')}</td><td>${c.ok?'PASS':'FAIL'}</td></tr>`).join('')}</table>`}
+async function evl(){const d=await api('/eval');$('#m').innerHTML=`<h3>Built-in evaluation: ${d.total} labelled fictional drafts</h3><p class="mut">${esc(d.note)}</p><div class="card">Precision <b>${d.precision}</b> | Recall <b>${d.recall}</b> | False positives on clean drafts <b>${d.clean_false_positives}/${d.groups.clean}</b> | Evidence-check correct <b>${d.support_correct}/${d.support_checked}</b> | Drafts fully correct <b>${d.correct}/${d.total}</b></div><table><tr><th>Group</th><th>Draft</th><th>Expected</th><th>Found</th><th>Result</th></tr>${d.cases.map(c=>`<tr><td>${esc(c.group)}</td><td>${esc(c.text)}</td><td>${esc(c.expected.join(', ')||'none')}</td><td>${esc(c.found.join(', ')||'none')}</td><td>${c.ok?'PASS':'MISS'}</td></tr>`).join('')}</table>`}
 boot();
 </script></body></html>"""
 

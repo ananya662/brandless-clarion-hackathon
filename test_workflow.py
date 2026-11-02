@@ -86,9 +86,42 @@ def test_duplicate_terminology_grouped_but_separate_terms_kept(c):
     assert sum(by.values()) == 3
 
 
-def test_eval_suite_still_passes(c):
+def test_evaluation_reports_30_labelled_drafts_honestly(c):
     e = c.get("/api/eval", headers=A).json()
-    assert e["correct"] == len(e["cases"]) and e["precision"] == 1.0 and e["recall"] == 1.0
+    assert e["total"] == 30 and e["groups"] == {"clean": 10, "seeded error": 10, "unsupported/ambiguous claim": 10}
+    assert e["clean_false_positives"] == 0 and e["precision"] == 1.0 and e["recall"] >= 0.95
+    assert [x["text"] for x in e["cases"] if not x["ok"]] == ["Customers see twice the revenue."]   # documented limitation: paraphrased claim
+    assert e["support_checked"] == e["support_correct"] == 4
+
+
+def test_claim_matcher_handles_percent_and_best_practices(c):
+    assert ("claim", "not_verifiable") in rules(det(c, new(c, "100% satisfaction, no questions asked.")))
+    assert not rules(det(c, new(c, "Read our best practices guide.")))
+
+
+def test_standard_findings_carry_verified_support(c):
+    d = det(c, new(c, DRAFT1))
+    by = {f["rule"]: f for f in d["findings"]}
+    assert by["fact"]["support"] == "verified" and "499" in by["fact"]["support_note"]
+    assert by["claim"]["support"] == "n/a" and not by["claim"]["needs_review"]
+
+
+def test_unsupported_citation_is_downgraded_and_routed_to_a_human(c):
+    c.post("/api/sources", json={"kind": "fact", "title": "Seat price", "body": "Pricing is under review.", "pattern": r"(?:USD)\s?([\d,]+)", "value": "20"}, headers=M)
+    f = next(x for x in det(c, new(c, "Seats cost USD 30 each."))["findings"] if x["rule"] == "fact")
+    assert f["support"] == "unsupported" and f["needs_review"] == 1
+    assert f["state"] == "suggestion" and f["message"].startswith("Unverified")     # never shown as a violation
+
+
+def test_partial_support_requires_a_reviewer_note(c):
+    v = new(c, "Every customer will double revenue in 90 days.")
+    f = det(c, v)["findings"][0]
+    assert (f["state"], f["support"], f["needs_review"]) == ("scope_check", "partial", 1)
+    c.post(f"/api/findings/{f['id']}/decide", json={"decision": "accept"}, headers=A)
+    assert c.post(f"/api/versions/{v}/submit", headers=A).status_code == 200
+    r = c.post(f"/api/versions/{v}/approve", json={"approve": True}, headers=R)
+    assert r.status_code == 400 and "NEEDS HUMAN CHECK" in r.json()["detail"]
+    assert c.post(f"/api/versions/{v}/approve", json={"approve": True, "note": "Checked the case study scope"}, headers=R).status_code == 200
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")

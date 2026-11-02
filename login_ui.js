@@ -1,4 +1,4 @@
-const { JSDOM } = require('jsdom'); const BASE='http://127.0.0.1:8011'; const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const { JSDOM } = require('jsdom'); const BASE=process.env.BASE||'http://127.0.0.1:8011'; const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 (async()=>{const html=await (await fetch(BASE+'/')).text();
 const dom=new JSDOM(html,{url:BASE+'/',runScripts:'dangerously',pretendToBeVisual:true,beforeParse(w){w.fetch=(u,o)=>fetch(new URL(u,BASE).href,o);w.alert=m=>{w.__a=m}}});
 const w=dom.window,d=w.document;await sleep(500);
