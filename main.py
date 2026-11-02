@@ -2,7 +2,7 @@
 Run:  pip install -r requirements.txt && uvicorn main:app --reload
 Optional: set ANTHROPIC_API_KEY to enable the AI tone/messaging layer (content is sent to Anthropic when on).
 """
-import os, re, json, sqlite3, time, base64, io, html, difflib, zipfile, urllib.request
+import os, re, json, sqlite3, time, base64, io, html, difflib, zipfile, hashlib, hmac, secrets, urllib.request
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -10,7 +10,9 @@ from pydantic import BaseModel
 DB = os.getenv("DB", "brandless.db")
 MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
 app = FastAPI(title="BrandLess")
-USERS = {"asha": ("Asha", "creator"), "manoj": ("Manoj", "manager"), "rina": ("Rina", "reviewer")}
+DEMO_PW = os.getenv("DEMO_PASSWORD", "demo123")
+SHOW_DEMO = os.getenv("SHOW_DEMO", "1") != "0"   # demo credentials are shown on the sign-in page for judges; set SHOW_DEMO=0 in real use
+DEMO_USERS = [("asha", "Asha", "creator"), ("manoj", "Manoj", "manager"), ("rina", "Rina", "reviewer")]
 
 
 def q(sql, a=(), one=False, w=False):
@@ -51,11 +53,28 @@ def init():
         for s in seed:
             q("INSERT INTO sources(kind,title,body,pattern,value) VALUES(?,?,?,?,?)", s, w=True)
     ensure_asset()
+    ensure_users()
+
+
+def hpw(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 120000).hex()
+
+
+def ensure_users():
+    q("CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, name TEXT, role TEXT, salt TEXT, pw TEXT)", w=True)
+    q("CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, username TEXT, exp REAL)", w=True)
+    if not q("SELECT 1 FROM users LIMIT 1", one=True):
+        for u, n, r in DEMO_USERS:
+            salt = secrets.token_hex(16)
+            q("INSERT INTO users(username,name,role,salt,pw) VALUES(?,?,?,?,?)", (u, n, r, salt, hpw(DEMO_PW, salt)), w=True)
 
 
 def who(x):
-    if x not in USERS: raise HTTPException(401, "Choose a demo user first")
-    return x, USERS[x][1]
+    sess = q("SELECT username,exp FROM sessions WHERE token=?", (x,), one=True) if x else None
+    if not sess or sess["exp"] < time.time(): raise HTTPException(401, "Please sign in")
+    u = q("SELECT role FROM users WHERE username=?", (sess["username"],), one=True)
+    if not u: raise HTTPException(401, "Please sign in")
+    return sess["username"], u["role"]
 
 
 def need(x, *roles):
@@ -199,19 +218,76 @@ class Ap(BaseModel):
     approve: bool; note: str = ""
 
 
+class Login(BaseModel):
+    username: str; password: str
+
+
 @app.get("/api/info")
 def info():
-    return {"ai": "on" if os.getenv("ANTHROPIC_API_KEY") else "off", "model": MODEL, "users": {k: v[0] + " (" + v[1] + ")" for k, v in USERS.items()}}
+    return {"ai": "on" if os.getenv("ANTHROPIC_API_KEY") else "off", "model": MODEL,
+            "demo": [{"username": u, "password": DEMO_PW, "role": r} for u, _, r in DEMO_USERS] if SHOW_DEMO else []}
+
+
+@app.post("/api/login")
+def login(b: Login):
+    name = b.username.strip().lower()[:40]
+    if q("SELECT COUNT(*) n FROM audit WHERE action='login_failed' AND who=? AND ts>?", (name, time.time() - 60), one=True)["n"] >= 8:
+        raise HTTPException(429, "Too many attempts. Wait a minute and try again.")
+    u = q("SELECT * FROM users WHERE username=?", (name,), one=True)
+    if not u or not hmac.compare_digest(hpw(b.password, u["salt"]), u["pw"]):
+        log(name, "login_failed"); raise HTTPException(401, "Invalid username or password")
+    t = secrets.token_urlsafe(32)
+    q("INSERT INTO sessions(token,username,exp) VALUES(?,?,?)", (t, u["username"], time.time() + 86400), w=True)
+    log(u["username"], "login"); return {"token": t, "username": u["username"], "name": u["name"], "role": u["role"]}
+
+
+@app.post("/api/logout")
+def logout(x_token: str = Header("")):
+    q("DELETE FROM sessions WHERE token=?", (x_token,), w=True); return {"ok": True}
+
+
+@app.get("/api/me")
+def me(x_token: str = Header("")):
+    u, r = who(x_token)
+    return {"username": u, "role": r, "name": q("SELECT name FROM users WHERE username=?", (u,), one=True)["name"]}
+
+
+@app.delete("/api/sources/{sid}")
+def del_source(sid: int, x_token: str = Header("")):
+    u = need(x_token, "manager")
+    n = q("SELECT COUNT(*) n FROM findings WHERE source_id=?", (sid,), one=True)["n"]
+    if n: raise HTTPException(409, f"This source is cited by {n} finding(s). Deactivate it instead so the history stays intact.")
+    q("DELETE FROM sources WHERE id=?", (sid,), w=True); log(u, "source_deleted", str(sid)); return {"ok": True}
+
+
+@app.delete("/api/contents/{cid}")
+def del_content(cid: int, x_token: str = Header("")):
+    u, r = who(x_token)
+    c = q("SELECT * FROM contents WHERE id=?", (cid,), one=True)
+    if not c: raise HTTPException(404, "Not found")
+    vs = q("SELECT id,status FROM versions WHERE content_id=?", (cid,))
+    if r != "manager" and (c["author"] != u or any(v["status"] == "approved" for v in vs)):
+        raise HTTPException(403, "Only the author can delete their own unapproved draft; a manager can delete any")
+    for v in vs:
+        q("DELETE FROM findings WHERE version_id=?", (v["id"],), w=True); q("DELETE FROM comments WHERE version_id=?", (v["id"],), w=True)
+    q("DELETE FROM versions WHERE content_id=?", (cid,), w=True); q("DELETE FROM contents WHERE id=?", (cid,), w=True)
+    log(u, "content_deleted", f"{cid} {c['title']}"); return {"ok": True}
+
+
+@app.get("/api/audit/export")
+def audit_export(x_token: str = Header("")):
+    need(x_token, "manager")
+    return {"exported_at": time.time(), "events": q("SELECT ts,who,action,detail FROM audit ORDER BY id")}
 
 
 @app.get("/api/sources")
-def sources(x_user: str = Header("")):
-    who(x_user); return q("SELECT * FROM sources ORDER BY id")
+def sources(x_token: str = Header("")):
+    who(x_token); return q("SELECT * FROM sources ORDER BY id")
 
 
 @app.post("/api/sources")
-def add_source(s: Src, x_user: str = Header("")):
-    u = need(x_user, "manager")
+def add_source(s: Src, x_token: str = Header("")):
+    u = need(x_token, "manager")
     if s.kind not in ("guideline", "term", "fact", "evidence", "asset"): raise HTTPException(400, "Bad kind")
     if s.pattern:
         try: re.compile(s.pattern)
@@ -221,23 +297,23 @@ def add_source(s: Src, x_user: str = Header("")):
 
 
 @app.post("/api/sources/{sid}/toggle")
-def toggle(sid: int, x_user: str = Header("")):
-    u = need(x_user, "manager")
+def toggle(sid: int, x_token: str = Header("")):
+    u = need(x_token, "manager")
     q("UPDATE sources SET active=1-active, version=version+1 WHERE id=?", (sid,), w=True)
     log(u, "source_toggled", str(sid)); return {"ok": True}
 
 
 @app.get("/api/contents")
-def contents(x_user: str = Header("")):
-    u, r = who(x_user)
+def contents(x_token: str = Header("")):
+    u, r = who(x_token)
     rows = q("""SELECT c.id,c.title,c.author,v.id vid,v.n,v.status FROM contents c JOIN versions v
                 ON v.id=(SELECT MAX(id) FROM versions WHERE content_id=c.id) ORDER BY c.id DESC""")
     return [x for x in rows if r == "manager" and x["status"] != "draft" or x["author"] == u or (r != "creator" and x["status"] != "draft")]
 
 
 @app.post("/api/contents")
-def new_content(b: New, x_user: str = Header("")):
-    u = need(x_user, "creator", "manager")
+def new_content(b: New, x_token: str = Header("")):
+    u = need(x_token, "creator", "manager")
     if not b.text.strip(): raise HTTPException(400, "Empty draft")
     cid = q("INSERT INTO contents(title,purpose,author) VALUES(?,?,?)", (b.title or "Untitled", b.purpose, u), w=True)
     vid = q("INSERT INTO versions(content_id,n,text,author) VALUES(?,1,?,?)", (cid, b.text, u), w=True)
@@ -255,8 +331,8 @@ def ver(vid):
 
 
 @app.get("/api/versions/{vid}")
-def get_version(vid: int, x_user: str = Header("")):
-    who(x_user); v = ver(vid); lt = latest(v)
+def get_version(vid: int, x_token: str = Header("")):
+    who(x_token); v = ver(vid); lt = latest(v)
     return {"version": v, "latest": lt["id"] == vid, "latest_id": lt["id"], "latest_n": lt["n"], "findings": q("SELECT * FROM findings WHERE version_id=?", (vid,)),
             "comments": q("SELECT * FROM comments WHERE version_id=?", (vid,)),
             "history": q("SELECT id,n,status,approved_by FROM versions WHERE content_id=? ORDER BY n", (v["content_id"],)),
@@ -264,8 +340,8 @@ def get_version(vid: int, x_user: str = Header("")):
 
 
 @app.post("/api/versions/{vid}/revise")
-def revise(vid: int, b: Txt, x_user: str = Header("")):
-    u = need(x_user, "creator", "manager"); v = ver(vid)
+def revise(vid: int, b: Txt, x_token: str = Header("")):
+    u = need(x_token, "creator", "manager"); v = ver(vid)
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can revise")
     lt = latest(v)
     if lt["id"] != vid: raise HTTPException(409, f"A newer version (v{lt['n']}) exists. Open the latest version to edit.")
@@ -276,8 +352,8 @@ def revise(vid: int, b: Txt, x_user: str = Header("")):
 
 
 @app.post("/api/findings/{fid}/decide")
-def decide(fid: int, b: Dec, x_user: str = Header("")):
-    u = need(x_user, "creator", "manager")
+def decide(fid: int, b: Dec, x_token: str = Header("")):
+    u = need(x_token, "creator", "manager")
     f = q("SELECT * FROM findings WHERE id=?", (fid,), one=True); v = ver(f["version_id"])
     if v["cauthor"] != u or v["status"] not in ("draft", "changes_requested"): raise HTTPException(403, "Not allowed on this version")
     if latest(v)["id"] != v["id"]: raise HTTPException(409, "This is an older version; respond on the latest version.")
@@ -288,8 +364,8 @@ def decide(fid: int, b: Dec, x_user: str = Header("")):
 
 
 @app.post("/api/versions/{vid}/submit")
-def submit(vid: int, x_user: str = Header("")):
-    u = need(x_user, "creator", "manager"); v = ver(vid)
+def submit(vid: int, x_token: str = Header("")):
+    u = need(x_token, "creator", "manager"); v = ver(vid)
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can submit")
     if latest(v)["id"] != vid: raise HTTPException(409, "Only the latest version can be submitted.")
     n = sum(1 for f in q("SELECT state,decision FROM findings WHERE version_id=?", (vid,)) if f["decision"] == "open" and f["state"] != "suggestion")
@@ -298,14 +374,14 @@ def submit(vid: int, x_user: str = Header("")):
 
 
 @app.post("/api/versions/{vid}/comment")
-def comment(vid: int, b: Cm, x_user: str = Header("")):
-    u, _ = who(x_user); ver(vid)
+def comment(vid: int, b: Cm, x_token: str = Header("")):
+    u, _ = who(x_token); ver(vid)
     q("INSERT INTO comments(version_id,who,text) VALUES(?,?,?)", (vid, u, b.text), w=True); return {"ok": True}
 
 
 @app.post("/api/versions/{vid}/approve")
-def approve(vid: int, b: Ap, x_user: str = Header("")):
-    u = need(x_user, "reviewer", "manager"); v = ver(vid)
+def approve(vid: int, b: Ap, x_token: str = Header("")):
+    u = need(x_token, "reviewer", "manager"); v = ver(vid)
     if v["status"] != "in_review": raise HTTPException(400, "Version is not awaiting review")
     if u == v["cauthor"]: raise HTTPException(403, "Self-approval is not allowed")
     fs = q("SELECT * FROM findings WHERE version_id=?", (vid,))
@@ -318,16 +394,16 @@ def approve(vid: int, b: Ap, x_user: str = Header("")):
 
 
 @app.get("/api/insights")
-def insights(x_user: str = Header("")):
-    who(x_user)
+def insights(x_token: str = Header("")):
+    who(x_token)
     return {"by_rule": q("SELECT rule,COUNT(*) n FROM findings GROUP BY rule ORDER BY n DESC"),
             "disputed": q("SELECT f.rule,s.title source,COUNT(*) n FROM findings f LEFT JOIN sources s ON s.id=f.source_id WHERE f.decision IN('dispute','reject') GROUP BY f.rule,f.source_id ORDER BY n DESC"),
             "audit": q("SELECT ts,who,action,detail FROM audit ORDER BY id DESC LIMIT 15")}
 
 
 @app.get("/api/versions/{vid}/diff")
-def diff(vid: int, x_user: str = Header("")):
-    who(x_user); v = ver(vid)
+def diff(vid: int, x_token: str = Header("")):
+    who(x_token); v = ver(vid)
     p = q("SELECT text,n FROM versions WHERE content_id=? AND n=?", (v["content_id"], v["n"] - 1), one=True)
     if not p: return {"ops": [], "prev": None}
     a, b = p["text"].split(), v["text"].split(); ops = []
@@ -340,8 +416,8 @@ def diff(vid: int, x_user: str = Header("")):
 
 
 @app.get("/api/versions/{vid}/record")
-def record(vid: int, x_user: str = Header("")):
-    who(x_user); v = ver(vid)
+def record(vid: int, x_token: str = Header("")):
+    who(x_token); v = ver(vid)
     return {"title": v["title"], "version": v["n"], "status": v["status"], "author": v["cauthor"], "approved_by": v["approved_by"],
             "note": v["note"], "ai_layer": v["ai"], "text": v["text"],
             "findings": q("SELECT rule,state,span,message,source_id,source_version,decision,reason FROM findings WHERE version_id=?", (vid,)),
@@ -354,8 +430,8 @@ class Up(BaseModel):
 
 
 @app.post("/api/extract")
-def extract(b: Up, x_user: str = Header("")):
-    need(x_user, "creator", "manager")
+def extract(b: Up, x_token: str = Header("")):
+    need(x_token, "creator", "manager")
     try:
         raw = base64.b64decode(b.data)
         if b.name.lower().endswith(".pdf"):
@@ -388,8 +464,8 @@ EVAL = [("NovaDesk starts at INR 499/month.", set()), ("Meet Nova Desk today.", 
 
 
 @app.get("/api/eval")
-def evaluate(x_user: str = Header("")):
-    who(x_user); rows = []; tp = fp = fn = 0
+def evaluate(x_token: str = Header("")):
+    who(x_token); rows = []; tp = fp = fn = 0
     for text, exp in EVAL:
         found = {f["rule"] for f in review(text, use_ai=False)[0]}
         tp += len(found & exp); fp += len(found - exp); fn += len(exp - found)
@@ -421,31 +497,39 @@ textarea{min-height:120px}.mut{color:var(--mut);font-size:13px}.badge{border:1px
 blockquote{margin:6px 0;padding-left:8px;border-left:3px solid var(--acc);color:var(--mut)}.item{cursor:pointer}.item:hover{border-color:var(--acc)}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left}footer{padding:12px 16px;color:var(--mut);font-size:12px}
 </style></head><body>
-<header><b>BrandLess</b><nav id="nav"></nav><span style="flex:1"></span><label class="mut">Demo user <select id="u" style="width:auto"></select></label></header>
+<header><b>BrandLess</b><nav id="nav"></nav><span style="flex:1"></span><span id="who" class="mut"></span></header>
 <section class="hero"><div><h1>Keep the message. Check the promise.</h1><p>BrandLess reviews content against approved brand facts and guidelines before publication, explains every finding with its source, and leaves the decision to people.</p><div class="steps"><span>1 Approve sources</span><span>2 Review draft</span><span>3 Resolve findings</span><span>4 Human approval</span><span>5 Learn from disputes</span></div></div></section>
 <main id="m"></main><footer id="ft"></footer>
 <script>
-let U=localStorage.u||'asha',CUR=null,FIX={},DRAFT={},SAVED={};const $=s=>document.querySelector(s);
+let TOKEN=localStorage.t||'',ME=null,INFO={},CUR=null,FIX={},DRAFT={},SAVED={};const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(p,m='GET',b){const r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json','X-User':U},body:b?JSON.stringify(b):undefined});const j=await r.json();if(!r.ok){alert(j.detail||'Error');throw 0}return j}
+async function api(p,m='GET',b){let r,j={};try{r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json','X-Token':TOKEN},body:b?JSON.stringify(b):undefined});j=await r.json()}catch(e){if(!r){alert('Cannot reach the server. Please retry.');throw 0}}if(r.status==401&&p!='/login'){TOKEN='';localStorage.removeItem('t');loginView();throw 0}if(!r.ok){alert(j.detail||'Something went wrong. Please try again.');throw 0}return j}
 const LBL={contradicted:'CONTRADICTED',not_verifiable:'NOT VERIFIABLE',conflict:'SOURCE CONFLICT',scope_check:'CHECK SCOPE',suggestion:'SUGGESTION',not_assessed:'NOT ASSESSED'};
 const SAMPLE2='Subject: Big news!\nHi team, NovaDesk is the best and fastest helpdesk, risk-free at Rs. 999 per month.\n![](banner.png)';
 const SAMPLE='Meet Nova Desk! Nova Desk starts at INR 299/month and every customer is guaranteed to double revenue in 7 days.\n\n![](hero.png)\n[text:#999999 on:#ffffff] Limited offer\n[colors: #FF00FF, #2F6FED]';
-async function boot(){const i=await api('/info');$('#u').innerHTML=Object.entries(i.users).map(([k,v])=>`<option value="${k}" ${k==U?'selected':''}>${esc(v)}</option>`).join('');
-$('#u').onchange=e=>{U=e.target.value;localStorage.u=U;CUR=null;tab('c')};
-$('#ft').textContent=i.ai=='on'?`AI disclosure: tone/messaging analysis sends draft text (emails and phone numbers masked) and guideline text to Anthropic (${i.model}). Exact checks run locally. AI findings are suggestions; humans decide.`:'AI disclosure: AI layer is OFF. All checks currently run locally with deterministic rules. Humans decide.';
-$('#nav').innerHTML=[['c','Content'],['s','Sources'],['i','Insights'],['e','Evaluation']].map(([k,t])=>`<button id="t${k}" onclick="tab('${k}')">${t}</button>`).join('');tab('c')}
+async function boot(){INFO=await (await fetch('/api/info')).json();
+$('#ft').textContent=INFO.ai=='on'?`AI disclosure: tone/messaging analysis sends draft text (emails and phone numbers masked) and guideline text to Anthropic (${INFO.model}). Exact checks run locally. AI findings are suggestions; humans decide.`:'AI disclosure: AI layer is OFF. All checks currently run locally with deterministic rules. Humans decide.';
+if(!TOKEN)return loginView();try{await start()}catch(e){}}
+async function start(){ME=await api('/me');$('#who').innerHTML=`${esc(ME.name)} (${ME.role}) <button onclick="logout()">Sign out</button>`;
+$('#nav').innerHTML=[['c','Content'],['s','Sources'],['i','Insights'],['e','Evaluation']].map(([k,t])=>`<button id="t${k}" onclick="tab('${k}')">${t}</button>`).join('');CUR=null;tab('c')}
+function loginView(){ME=null;$('#nav').innerHTML='';$('#who').innerHTML='';
+$('#m').innerHTML=`<div class="card" style="max-width:520px;margin:20px auto"><h3>Sign in to BrandLess</h3><input id="lu" placeholder="Username" autocomplete="username"><input id="lp" type="password" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key=='Enter')login()"><button onclick="login()">Sign in</button>${(INFO.demo||[]).length?`<p class="mut"><b>Demo accounts</b> (fictional data only). Click a row to fill it in. Creator drafts and responds; Manager manages sources; Reviewer approves.</p><table><tr><th>Username</th><th>Password</th><th>Role</th></tr>${INFO.demo.map(d=>`<tr style="cursor:pointer" onclick="$('#lu').value='${esc(d.username)}';$('#lp').value='${esc(d.password)}'"><td>${esc(d.username)}</td><td>${esc(d.password)}</td><td>${esc(d.role)}</td></tr>`).join('')}</table>`:''}</div>`}
+async function login(){let r;try{r=await api('/login','POST',{username:$('#lu').value,password:$('#lp').value})}catch(e){return}TOKEN=r.token;localStorage.t=TOKEN;try{await start()}catch(e){}}
+async function logout(){try{await api('/logout','POST')}catch(e){}TOKEN='';localStorage.removeItem('t');loginView()}
+async function delC(id){if(!confirm('Delete this draft and all its versions? This cannot be undone.'))return;await api('/contents/'+id,'DELETE');CUR=null;tab('c')}
+async function delS(id){if(!confirm('Delete this source?'))return;await api('/sources/'+id,'DELETE');srcs()}
+async function exportAudit(){const j=await api('/audit/export');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(j,null,2)],{type:'application/json'}));a.download='audit-trail.json';a.click()}
 function tab(k){['c','s','i','e'].forEach(x=>$('#t'+x).classList.toggle('on',x==k));({c:content,s:srcs,i:ins,e:evl})[k]()}
 async function content(){const l=await api('/contents');
 $('#m').innerHTML=`<div class="g"><div><button onclick="newForm()">+ New draft</button>${l.map(x=>`<div class="card item" onclick="openV(${x.vid})"><b>${esc(x.title)}</b><br><span class="mut">v${x.n} | ${x.status} | ${esc(x.author)}</span></div>`).join('')||'<p class="mut">Nothing here yet.</p>'}</div><div id="p"></div></div>`;
 CUR?openV(CUR):newForm()}
-function newForm(){CUR=null;$('#p').innerHTML=`<div class="card"><h3>Submit a draft for review</h3><p class="mut"><b>Try it in 3 steps:</b> 1) Load a sample (or upload a PDF/TXT) and click Run review. 2) Respond to each finding. 3) Submit, then switch the Demo user (top right) to Rina to approve.</p><input id="ti" placeholder="Title (e.g. Product launch post)"><input id="pu" placeholder="Purpose / audience (kept with the draft)"><textarea id="tx" placeholder="Paste your text here"></textarea><button onclick="$('#tx').value=SAMPLE;$('#ti').value='NovaDesk launch post';$('#pu').value='Announce to existing customers'">Load sample draft</button> <button onclick="$('#tx').value=SAMPLE2;$('#ti').value='Launch email';$('#pu').value='Email to leads'">Load email sample</button> <input type="file" id="fl" accept=".pdf,.docx,.txt,.md,.png,.jpg,.jpeg" onchange="upl(this)" style="width:auto"> <button onclick="create()">Run review</button><p class="mut">Checks: terminology, approved facts, promotional claims, tone (if AI on), alt text and contrast (write [text:#hex on:#hex]).</p></div>`}
+function newForm(){CUR=null;$('#p').innerHTML=`<div class="card"><h3>Submit a draft for review</h3><p class="mut"><b>Try it in 3 steps:</b> 1) Load a sample (or upload a PDF/TXT) and click Run review. 2) Respond to each finding. 3) Submit, then sign out and sign in as Rina (reviewer; credentials are on the sign-in page) to approve.</p><input id="ti" placeholder="Title (e.g. Product launch post)"><input id="pu" placeholder="Purpose / audience (kept with the draft)"><textarea id="tx" placeholder="Paste your text here"></textarea><button onclick="$('#tx').value=SAMPLE;$('#ti').value='NovaDesk launch post';$('#pu').value='Announce to existing customers'">Load sample draft</button> <button onclick="$('#tx').value=SAMPLE2;$('#ti').value='Launch email';$('#pu').value='Email to leads'">Load email sample</button> <input type="file" id="fl" accept=".pdf,.docx,.txt,.md,.png,.jpg,.jpeg" onchange="upl(this)" style="width:auto"> <button onclick="create()">Run review</button><p class="mut">Checks: terminology, approved facts, promotional claims, tone (if AI on), alt text and contrast (write [text:#hex on:#hex]).</p></div>`}
 async function create(){const r=await api('/contents','POST',{title:$('#ti').value,purpose:$('#pu').value,text:$('#tx').value});CUR=r.vid;content()}
-async function openV(id){CUR=id;const d=await api('/versions/'+id),v=d.version,me=U,mine=v.cauthor==me,ed=mine&&d.latest&&['draft','changes_requested'].includes(v.status);FIX={};SAVED[id]=v.text;const df=v.n>1?await api('/versions/'+id+'/diff'):null;
-const rev=!mine&&v.status=='in_review'&&U!='asha';
+async function openV(id){CUR=id;const d=await api('/versions/'+id),v=d.version,me=ME.username,mine=v.cauthor==me,ed=mine&&d.latest&&['draft','changes_requested'].includes(v.status);FIX={};SAVED[id]=v.text;const df=v.n>1?await api('/versions/'+id+'/diff'):null;
+const rev=!mine&&v.status=='in_review'&&ME.role!='creator';
 $('#p').innerHTML=`<div class="card"><h3>${esc(v.title)} <span class="badge">v${v.n}: ${v.status.toUpperCase()}</span></h3><div class="mut">Purpose: ${esc(v.purpose)||'-'} | Author: ${esc(v.cauthor)} | AI layer: ${v.ai} ${v.approved_by?'| Approved by '+esc(v.approved_by):''} ${v.note?'| Note: '+esc(v.note):''}</div>
 <div class="mut">Versions: ${d.history.map(h=>`<a href="#" onclick="openV(${h.id});return false">v${h.n} (${h.status})</a>`).join(' | ')}</div>
-${d.latest?'':`<div class="card"><b>Older version (read-only).</b> The latest is v${d.latest_n}. <a href="#" onclick="openV(${d.latest_id});return false">Open latest</a></div>`}<textarea id="ed" ${ed?'':'readonly'} oninput="DRAFT[${id}]=this.value;mark(${id})">${esc(ed&&DRAFT[id]!==undefined?DRAFT[id]:v.text)}</textarea><div id="uns" class="mut" style="color:#b54708">${ed&&DRAFT[id]!==undefined&&DRAFT[id]!==v.text?'Unsaved changes: click "Save as new version and re-run review" to check them.':''}</div>${v.status=='approved'?`<button onclick="rec(${id})">Download approval record</button>`:''}
+${d.latest?'':`<div class="card"><b>Older version (read-only).</b> The latest is v${d.latest_n}. <a href="#" onclick="openV(${d.latest_id});return false">Open latest</a></div>`}<textarea id="ed" ${ed?'':'readonly'} oninput="DRAFT[${id}]=this.value;mark(${id})">${esc(ed&&DRAFT[id]!==undefined?DRAFT[id]:v.text)}</textarea><div id="uns" class="mut" style="color:#b54708">${ed&&DRAFT[id]!==undefined&&DRAFT[id]!==v.text?'Unsaved changes: click "Save as new version and re-run review" to check them.':''}</div>${v.status=='approved'?`<button onclick="rec(${id})">Download approval record</button>`:''}${(mine||ME.role=='manager')?`<button onclick="delC(${v.content_id})">Delete draft</button>`:''}
 ${ed?`<button onclick="saveV(${id})">Save as new version and re-run review</button> <button onclick="api('/versions/${id}/submit','POST').then(()=>openV(${id}))">Submit for approval</button>`:''}</div>
 ${df&&df.ops.length?`<div class="card"><b>Changes since v${df.prev}</b><br>${df.ops.map(o=>o[0]=='='?esc(o[1]):o[0]=='-'?'<del>'+esc(o[1])+'</del>':'<ins>'+esc(o[1])+'</ins>').join(' ')}</div>`:''}<h4>Findings (${d.findings.length})</h4>${d.findings.map(f=>{if(f.fix)FIX[f.id]=f;return`<div class="card"><span class="badge s-${f.state}">${LBL[f.state]}</span> <i>${f.rule}</i> ${f.occurrences>1?'<b>('+f.occurrences+' occurrences)</b> ':''}${f.span?'<code>'+esc(f.span)+'</code>':''}<p>${esc(f.message)}</p>
 ${f.quote?`<blockquote>Source: ${esc(d.src[f.source_id]||'')} (v${f.source_version}): ${esc(f.quote)}</blockquote>`:''}${f.suggestion?`<div>Suggestion: ${esc(f.suggestion)}</div>`:''}
@@ -462,11 +546,11 @@ async function saveV(id){const r=await api('/versions/'+id+'/revise','POST',{tex
 async function cmt(id){if(!$('#cm').value)return;await api('/versions/'+id+'/comment','POST',{text:$('#cm').value});openV(id)}
 async function appr(id,a){await api('/versions/'+id+'/approve','POST',{approve:a,note:$('#nt').value});openV(id)}
 async function srcs(){const l=await api('/sources');$('#m').innerHTML=`<p class="mut">Approved source library. Only the Manager can add or switch sources. Switching creates a new source version; past reviews keep the version they used.</p>
-<table><tr><th>#</th><th>Kind</th><th>Title</th><th>Content</th><th>v</th><th>Active</th><th></th></tr>${l.map(s=>`<tr><td>${s.id}</td><td>${s.kind}</td><td>${esc(s.title)}</td><td>${esc(s.body)}${s.value?'<br><span class="mut">value/banned: '+esc(s.value)+'</span>':''}</td><td>${s.version}</td><td>${s.active?'yes':'no'}</td><td><button onclick="tg(${s.id})">Toggle</button></td></tr>`).join('')}</table>
+<table><tr><th>#</th><th>Kind</th><th>Title</th><th>Content</th><th>v</th><th>Active</th><th></th></tr>${l.map(s=>`<tr><td>${s.id}</td><td>${s.kind}</td><td>${esc(s.title)}</td><td>${esc(s.body)}${s.value?'<br><span class="mut">value/banned: '+esc(s.value)+'</span>':''}</td><td>${s.version}</td><td>${s.active?'yes':'no'}</td><td><button onclick="tg(${s.id})">Toggle</button> ${ME.role=='manager'?`<button onclick="delS(${s.id})">Delete</button>`:''}</td></tr>`).join('')}</table>
 <div class="card"><h4>Add source (Manager)</h4><select id="k"><option>guideline</option><option>term</option><option>fact</option><option>evidence</option><option>asset</option></select><input id="st" placeholder="Title"><textarea id="sb" placeholder="Approved text"></textarea><input id="sp" placeholder="fact only: regex with one group, e.g. (?:INR)\\s?([\\d,]+)"><input id="sv" placeholder="fact: approved value | term: banned spellings separated by |"><button onclick="addS()">Add</button></div>`}
 async function tg(i){await api('/sources/'+i+'/toggle','POST');srcs()}
 async function addS(){await api('/sources','POST',{kind:$('#k').value,title:$('#st').value,body:$('#sb').value,pattern:$('#sp').value,value:$('#sv').value});srcs()}
-async function ins(){const d=await api('/insights');$('#m').innerHTML=`<h3>Governance insights</h3><div class="card"><b>Findings by rule type</b><table>${d.by_rule.map(r=>`<tr><td>${r.rule}</td><td>${r.n}</td></tr>`).join('')||'<tr><td>No data yet</td></tr>'}</table></div>
+async function ins(){const d=await api('/insights');$('#m').innerHTML=`<h3>Governance insights</h3>${ME.role=='manager'?'<button onclick="exportAudit()">Export audit trail (JSON)</button>':''}<div class="card"><b>Findings by rule type</b><table>${d.by_rule.map(r=>`<tr><td>${r.rule}</td><td>${r.n}</td></tr>`).join('')||'<tr><td>No data yet</td></tr>'}</table></div>
 <div class="card"><b>Possibly unclear guidelines</b> <span class="mut">(findings creators disputed or rejected; a manager decides whether to clarify)</span><table>${d.disputed.map(r=>`<tr><td>${r.rule}</td><td>${esc(r.source||'no source')}</td><td>${r.n}</td></tr>`).join('')||'<tr><td>None yet</td></tr>'}</table></div>
 <div class="card"><b>Audit trail (latest)</b><table>${d.audit.map(a=>`<tr><td>${new Date(a.ts*1000).toLocaleTimeString()}</td><td>${esc(a.who)}</td><td>${a.action}</td><td>${esc(a.detail)}</td></tr>`).join('')}</table></div>`}
 async function rec(id){const j=await api('/versions/'+id+'/record');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(j,null,2)],{type:'application/json'}));a.download='approval-record-v'+id+'.json';a.click()}
