@@ -41,6 +41,10 @@ def init():
     q("""CREATE TABLE IF NOT EXISTS findings(id INTEGER PRIMARY KEY, version_id INT, rule TEXT, state TEXT, span TEXT, message TEXT, source_id INT, source_version INT, quote TEXT, suggestion TEXT, fix TEXT, decision TEXT DEFAULT 'open', reason TEXT)""", w=True)
     try: q("ALTER TABLE findings ADD COLUMN occurrences INT DEFAULT 1", w=True)
     except sqlite3.OperationalError: pass
+    q("""CREATE TABLE IF NOT EXISTS proposals(id INTEGER PRIMARY KEY, doc TEXT, kind TEXT, title TEXT, body TEXT, pattern TEXT, value TEXT, passage TEXT, flag TEXT, status TEXT DEFAULT 'pending', source_id INT)""", w=True)
+    for col in ("passage TEXT", "origin TEXT"):
+        try: q("ALTER TABLE sources ADD COLUMN " + col, w=True)
+        except sqlite3.OperationalError: pass
     q("""CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY, version_id INT, who TEXT, text TEXT)""", w=True)
     q("""CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, who TEXT, action TEXT, detail TEXT)""", w=True)
     if not q("SELECT 1 FROM sources LIMIT 1", one=True):
@@ -272,6 +276,126 @@ def del_content(cid: int, x_token: str = Header("")):
         q("DELETE FROM findings WHERE version_id=?", (v["id"],), w=True); q("DELETE FROM comments WHERE version_id=?", (v["id"],), w=True)
     q("DELETE FROM versions WHERE content_id=?", (cid,), w=True); q("DELETE FROM contents WHERE id=?", (cid,), w=True)
     log(u, "content_deleted", f"{cid} {c['title']}"); return {"ok": True}
+
+
+# ---------------- guideline import (proposed rules, confirmed by a manager) ----------------
+INR_PAT = r"(?:INR|₹|Rs\.?)\s?([\d,]+)"   # identical to the seeded price pattern so equal patterns are grouped as conflicting sources
+VAGUE = re.compile(r"\b(appropriate|professional|friendly|as needed|where possible|reasonable|suitable|engaging|nice|good)\b", re.I)
+QT = "[\"\u201c\u2018']([^\"\u201d\u2019']{2,40})[\"\u201d\u2019']"
+
+
+def propose(text):
+    out, prices = [], {}
+    sents = [x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+", text) if x.strip()]
+    for s in sents:
+        m = re.search(r"(?:use|write|say|spell)\s+" + QT + r"\s+(?:instead of|not|rather than)\s+" + QT, s, re.I)
+        if m:
+            out.append(dict(kind="term", title=m.group(1), value=m.group(2), passage=s, body=f"Use \u201c{m.group(1)}\u201d, not \u201c{m.group(2)}\u201d.")); continue
+        m = re.search(r"(?:never|do not|don't|avoid)\s+(?:use|say|write|call it)?\s*" + QT, s, re.I)
+        if m:
+            out.append(dict(kind="term", title="", value=m.group(1), passage=s, body=f"Avoid \u201c{m.group(1)}\u201d.", flag="No preferred wording is given. Add one before accepting.")); continue
+        cm = re.search(r"(INR|\u20b9|Rs\.?|USD|\$|EUR|\u20ac)\s?([\d,]+)(\.\d+)?", s)
+        if cm:
+            key = "INR" if cm.group(1) in ("INR", "\u20b9", "Rs", "Rs.") else cm.group(1)
+            val = cm.group(2).replace(",", "")
+            label = re.sub(r"(?i)^(the|our)\s+|\s+(is|are|at|of|from|costs?)$", "", re.sub(r"\s+", " ", s[:cm.start()]).strip(" :,-"))[:40] or "Price"
+            pat = INR_PAT if key == "INR" else r"(?:" + re.escape(cm.group(1)) + r")\s?([\d,]+)"
+            p = dict(kind="fact", title=label[:1].upper() + label[1:], value=val, pattern=pat, passage=s, body=f"{label[:1].upper() + label[1:]}: {key} {val}.", key=key,
+                     flag=("Decimal amounts are not supported by the fact checker; edit the value or pattern. " if cm.group(3) else "") + f"This rule checks every {key} amount in drafts against {val}.")
+            prices.setdefault(key, []).append(p); out.append(p); continue
+    hexes = list(dict.fromkeys(h.upper() for h in re.findall(r"#[0-9a-fA-F]{6}\b", text)))
+    if hexes:
+        out.append(dict(kind="asset", title="Brand palette", value="|".join(hexes), body="Approved brand colours from the guideline.", passage=next((x for x in sents if "#" in x), "")))
+    used = {id(o) for o in out}
+    for s in sents:
+        if re.search(r"\b(must|should|always|never|avoid|do not|don't)\b", s, re.I) and not any(s == o.get("passage") for o in out):
+            v = VAGUE.search(s)
+            out.append(dict(kind="guideline", title=s[:40], body=s, passage=s, flag=(f"Vague wording (\u201c{v.group(0)}\u201d): it cannot be checked automatically. Make it specific, or keep it as a human guideline." if v else "")))
+            if sum(o["kind"] == "guideline" for o in out) >= 15: break
+    for key, ps in prices.items():
+        vals = sorted({p["value"] for p in ps})
+        if len(vals) > 1:
+            for p in ps: p["flag"] = f"The document lists different {key} amounts ({', '.join(vals)}). Confirm which is approved. " + p["flag"]
+    old = q("SELECT id,kind,title,value,pattern FROM sources WHERE active=1")
+    for p in out:
+        if p["kind"] == "fact":
+            for o in old:
+                if o["kind"] == "fact" and (p["key"] in (o["pattern"] or "")) and o["value"] != p["value"]:
+                    p["flag"] = f"Conflicts with active source #{o['id']} ({p['key']} {o['value']}). Both would apply, so drafts will show a source conflict. " + p["flag"]
+        if p["kind"] == "term":
+            for o in old:
+                if o["kind"] == "term" and p["title"] and o["title"].lower() == p["title"].lower(): p["flag"] = (p.get("flag") or "") + f"A term source for this name already exists (#{o['id']}). "
+            for o in out:
+                if o is not p and o["kind"] == "term" and o["title"] and p["value"].lower() == o["title"].lower():
+                    p["flag"] = (p.get("flag") or "") + f"Contradicts another rule: \u201c{p['value']}\u201d is banned here but preferred elsewhere. "
+    return out
+
+
+class Imp(BaseModel):
+    name: str = "guideline"; text: str
+class Pr(BaseModel):
+    title: str = ""; body: str = ""; pattern: str | None = None; value: str | None = None
+
+
+def make_source(p, title, body, pat, val, u):
+    k = p["kind"]
+    if k == "term" and not title: raise HTTPException(400, "Add the preferred wording before accepting.")
+    if k in ("term", "fact", "asset") and not val: raise HTTPException(400, "A value is required for this rule.")
+    if not body: raise HTTPException(400, "The rule text cannot be empty.")
+    if k == "fact":
+        try: ok = re.compile(pat or "").groups == 1
+        except re.error: ok = False
+        if not ok: raise HTTPException(400, "The pattern must be a valid regular expression with exactly one capture group.")
+    if k == "asset" and not all(re.fullmatch(r"#[0-9a-fA-F]{6}", x) for x in val.split("|")): raise HTTPException(400, "Palette values must be hex colours separated by |.")
+    sid = q("INSERT INTO sources(kind,title,body,pattern,value,passage,origin) VALUES(?,?,?,?,?,?,?)", (k, title or p["title"], body, pat if k == "fact" else None, val, p["passage"], p["doc"]), w=True)
+    q("UPDATE proposals SET status='accepted', source_id=? WHERE id=?", (sid, p["id"]), w=True)
+    log(u, "proposal_accepted", f"#{p['id']} -> source #{sid} ({k}) from {p['doc']}"); return sid
+
+
+@app.post("/api/import")
+def import_guideline(b: Imp, x_token: str = Header("")):
+    u = need(x_token, "manager")
+    if not b.text.strip(): raise HTTPException(400, "Paste or upload some guideline text first.")
+    ps = propose(b.text[:50000]); seen = set(); n = 0
+    for p in ps:
+        k = (p["kind"], p["title"], p.get("value"), p["body"])
+        if k in seen: continue
+        seen.add(k); n += 1
+        q("INSERT INTO proposals(doc,kind,title,body,pattern,value,passage,flag) VALUES(?,?,?,?,?,?,?,?)", (b.name[:80], p["kind"], p["title"], p["body"], p.get("pattern"), p.get("value"), p["passage"], (p.get("flag") or "").strip() or None), w=True)
+    log(u, "guideline_imported", f"{b.name}: {n} proposed rules"); return {"created": n}
+
+
+@app.get("/api/proposals")
+def proposals(x_token: str = Header("")):
+    need(x_token, "manager"); return q("SELECT * FROM proposals WHERE status='pending' ORDER BY id")
+
+
+def pending(pid):
+    p = q("SELECT * FROM proposals WHERE id=?", (pid,), one=True)
+    if not p: raise HTTPException(404, "Not found")
+    if p["status"] != "pending": raise HTTPException(409, "This proposal was already handled.")
+    return p
+
+
+@app.post("/api/proposals/{pid}/accept")
+def accept_proposal(pid: int, b: Pr, x_token: str = Header("")):
+    u = need(x_token, "manager"); p = pending(pid)
+    return {"source_id": make_source(p, b.title.strip(), b.body.strip(), (b.pattern or "").strip() or None, (b.value or "").strip() or None, u)}
+
+
+@app.post("/api/proposals/{pid}/reject")
+def reject_proposal(pid: int, x_token: str = Header("")):
+    u = need(x_token, "manager"); pending(pid)
+    q("UPDATE proposals SET status='rejected' WHERE id=?", (pid,), w=True); log(u, "proposal_rejected", str(pid)); return {"ok": True}
+
+
+@app.post("/api/proposals/accept-clean")
+def accept_clean(x_token: str = Header("")):
+    u = need(x_token, "manager"); n = 0
+    for p in q("SELECT * FROM proposals WHERE status='pending' AND flag IS NULL ORDER BY id"):
+        if p["kind"] == "term" and not p["title"]: continue
+        make_source(p, p["title"], p["body"], p["pattern"], p["value"], u); n += 1
+    return {"accepted": n}
 
 
 @app.get("/api/audit/export")
@@ -516,6 +640,14 @@ function loginView(){ME=null;$('#nav').innerHTML='';$('#who').innerHTML='';
 $('#m').innerHTML=`<div class="card" style="max-width:520px;margin:20px auto"><h3>Sign in to BrandLess</h3><input id="lu" placeholder="Username" autocomplete="username"><input id="lp" type="password" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key=='Enter')login()"><button onclick="login()">Sign in</button>${(INFO.demo||[]).length?`<p class="mut"><b>Demo accounts</b> (fictional data only). Click a row to fill it in. Creator drafts and responds; Manager manages sources; Reviewer approves.</p><table><tr><th>Username</th><th>Password</th><th>Role</th></tr>${INFO.demo.map(d=>`<tr style="cursor:pointer" onclick="$('#lu').value='${esc(d.username)}';$('#lp').value='${esc(d.password)}'"><td>${esc(d.username)}</td><td>${esc(d.password)}</td><td>${esc(d.role)}</td></tr>`).join('')}</table>`:''}</div>`}
 async function login(){let r;try{r=await api('/login','POST',{username:$('#lu').value,password:$('#lp').value})}catch(e){return}TOKEN=r.token;localStorage.t=TOKEN;try{await start()}catch(e){}}
 async function logout(){try{await api('/logout','POST')}catch(e){}TOKEN='';localStorage.removeItem('t');loginView()}
+const SAMPLEG='Brand voice: Use "NovaDesk" instead of "Nova Desk". Never use "Novadesk".\nThe starting price is INR 599 per month. Annual plans are INR 499 per month.\nOur colours are #1F2A44, #2F6FED and #FFFFFF.\nAlways keep a professional and friendly tone.\nYou must not promise guaranteed results.';
+const IMPORT_HTML=`<div class="card"><h4>Import a guideline document</h4><p class="mut">Upload a PDF, DOCX or TXT (or paste text). BrandLess proposes draft rules with the source passage and flags vague or conflicting lines. Nothing becomes active until you accept it.</p><input type="file" id="gf" accept=".pdf,.docx,.txt,.md" onchange="gfile(this)"><input id="gn" placeholder="Document name"><textarea id="gt" placeholder="...or paste guideline text here"></textarea><button onclick="$('#gt').value=SAMPLEG;$('#gn').value='Sample brand guide'">Load sample guideline</button> <button onclick="imp()">Analyse guideline</button></div>`;
+function gfile(i){const f=i.files[0];if(!f)return;const r=new FileReader();r.onload=async()=>{const j=await api('/extract','POST',{name:f.name,data:r.result.split(',')[1]});$('#gt').value=j.text;if(!$('#gn').value)$('#gn').value=f.name};r.readAsDataURL(f)}
+async function imp(){const j=await api('/import','POST',{name:$('#gn').value||'pasted guideline',text:$('#gt').value});alert(j.created+' draft rule(s) proposed. Review them below; nothing is active until you accept.');loadProps()}
+async function loadProps(){const l=await api('/proposals');$('#props').innerHTML=l.length?`<h4>Proposed rules (${l.length}) <button onclick="accClean()">Accept all without warnings</button></h4>`+l.map(p=>`<div class="card"><span class="badge">${p.kind.toUpperCase()}</span> <span class="mut">from ${esc(p.doc)}</span>${p.flag?`<p style="color:#b54708"><b>Needs attention:</b> ${esc(p.flag)}</p>`:''}<blockquote>${esc(p.passage)}</blockquote><input id="p${p.id}t" value="${esc(p.title)}" placeholder="${p.kind=='term'?'Preferred wording':'Title'}"><textarea id="p${p.id}b" style="min-height:50px">${esc(p.body)}</textarea>${p.kind=='fact'?`<input id="p${p.id}p" value="${esc(p.pattern||'')}" placeholder="Pattern">`:''}${p.kind!='guideline'?`<input id="p${p.id}v" value="${esc(p.value||'')}" placeholder="${p.kind=='term'?'Banned wordings (separate with |)':'Value'}">`:''}<button onclick="accP(${p.id})">Accept and activate</button> <button onclick="rejP(${p.id})">Reject</button></div>`).join(''):'<p class="mut">No pending proposals.</p>'}
+async function accP(id){const g=s=>{const e=$('#p'+id+s);return e?e.value:''};await api('/proposals/'+id+'/accept','POST',{title:g('t'),body:g('b'),pattern:g('p'),value:g('v')});srcs()}
+async function rejP(id){await api('/proposals/'+id+'/reject','POST');loadProps()}
+async function accClean(){const j=await api('/proposals/accept-clean','POST');alert(j.accepted+' rule(s) activated.');srcs()}
 async function delC(id){if(!confirm('Delete this draft and all its versions? This cannot be undone.'))return;await api('/contents/'+id,'DELETE');CUR=null;tab('c')}
 async function delS(id){if(!confirm('Delete this source?'))return;await api('/sources/'+id,'DELETE');srcs()}
 async function exportAudit(){const j=await api('/audit/export');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(j,null,2)],{type:'application/json'}));a.download='audit-trail.json';a.click()}
@@ -546,8 +678,8 @@ async function saveV(id){const r=await api('/versions/'+id+'/revise','POST',{tex
 async function cmt(id){if(!$('#cm').value)return;await api('/versions/'+id+'/comment','POST',{text:$('#cm').value});openV(id)}
 async function appr(id,a){await api('/versions/'+id+'/approve','POST',{approve:a,note:$('#nt').value});openV(id)}
 async function srcs(){const l=await api('/sources');$('#m').innerHTML=`<p class="mut">Approved source library. Only the Manager can add or switch sources. Switching creates a new source version; past reviews keep the version they used.</p>
-<table><tr><th>#</th><th>Kind</th><th>Title</th><th>Content</th><th>v</th><th>Active</th><th></th></tr>${l.map(s=>`<tr><td>${s.id}</td><td>${s.kind}</td><td>${esc(s.title)}</td><td>${esc(s.body)}${s.value?'<br><span class="mut">value/banned: '+esc(s.value)+'</span>':''}</td><td>${s.version}</td><td>${s.active?'yes':'no'}</td><td><button onclick="tg(${s.id})">Toggle</button> ${ME.role=='manager'?`<button onclick="delS(${s.id})">Delete</button>`:''}</td></tr>`).join('')}</table>
-<div class="card"><h4>Add source (Manager)</h4><select id="k"><option>guideline</option><option>term</option><option>fact</option><option>evidence</option><option>asset</option></select><input id="st" placeholder="Title"><textarea id="sb" placeholder="Approved text"></textarea><input id="sp" placeholder="fact only: regex with one group, e.g. (?:INR)\\s?([\\d,]+)"><input id="sv" placeholder="fact: approved value | term: banned spellings separated by |"><button onclick="addS()">Add</button></div>`}
+<table><tr><th>#</th><th>Kind</th><th>Title</th><th>Content</th><th>v</th><th>Active</th><th></th></tr>${l.map(s=>`<tr><td>${s.id}</td><td>${s.kind}</td><td>${esc(s.title)}</td><td>${esc(s.body)}${s.origin?'<br><span class="mut">from '+esc(s.origin)+'</span>':''}${s.value?'<br><span class="mut">value/banned: '+esc(s.value)+'</span>':''}</td><td>${s.version}</td><td>${s.active?'yes':'no'}</td><td><button onclick="tg(${s.id})">Toggle</button> ${ME.role=='manager'?`<button onclick="delS(${s.id})">Delete</button>`:''}</td></tr>`).join('')}</table>
+<div class="card"><h4>Add source (Manager)</h4><select id="k"><option>guideline</option><option>term</option><option>fact</option><option>evidence</option><option>asset</option></select><input id="st" placeholder="Title"><textarea id="sb" placeholder="Approved text"></textarea><input id="sp" placeholder="fact only: regex with one group, e.g. (?:INR)\\s?([\\d,]+)"><input id="sv" placeholder="fact: approved value | term: banned spellings separated by |"><button onclick="addS()">Add</button></div>${ME.role=='manager'?IMPORT_HTML:''}<div id="props"></div>`;if(ME.role=='manager')loadProps()}
 async function tg(i){await api('/sources/'+i+'/toggle','POST');srcs()}
 async function addS(){await api('/sources','POST',{kind:$('#k').value,title:$('#st').value,body:$('#sb').value,pattern:$('#sp').value,value:$('#sv').value});srcs()}
 async function ins(){const d=await api('/insights');$('#m').innerHTML=`<h3>Governance insights</h3>${ME.role=='manager'?'<button onclick="exportAudit()">Export audit trail (JSON)</button>':''}<div class="card"><b>Findings by rule type</b><table>${d.by_rule.map(r=>`<tr><td>${r.rule}</td><td>${r.n}</td></tr>`).join('')||'<tr><td>No data yet</td></tr>'}</table></div>

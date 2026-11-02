@@ -162,3 +162,62 @@ def test_delete_controls_and_audit_export(c):
     assert c.delete(f"/api/contents/{cid}", headers=A).status_code == 200
     assert c.get(f"/api/versions/{v}", headers=A).status_code == 404
     assert "content_deleted" in [e["action"] for e in c.get("/api/audit/export", headers=M).json()["events"]]
+
+
+GUIDE = """Brand voice: Use "NovaDesk" instead of "Nova Desk". Never use "Novadesk".
+The starting price is INR 599 per month. Annual plans are INR 499 per month.
+Our colours are #1F2A44, #2F6FED and #FFFFFF.
+Always keep a professional and friendly tone.
+You must not promise guaranteed results."""
+
+
+def props(c): return c.get("/api/proposals", headers=M).json()
+
+
+def test_guideline_import_proposes_flags_and_needs_manager_confirmation(c):
+    assert c.post("/api/import", json={"text": GUIDE}, headers=A).status_code == 403
+    assert c.post("/api/import", json={"text": "   "}, headers=M).status_code == 400
+    before = len(c.get("/api/sources", headers=M).json())
+    assert c.post("/api/import", json={"name": "guide.txt", "text": GUIDE}, headers=M).json()["created"] >= 6
+    assert len(c.get("/api/sources", headers=M).json()) == before            # nothing is active until accepted
+    p = props(c); kinds = [x["kind"] for x in p]
+    assert kinds.count("term") == 2 and kinds.count("fact") == 2 and "asset" in kinds
+    assert all(x["passage"] for x in p)                                         # every proposal cites its source passage
+    bare = next(x for x in p if x["kind"] == "term" and not x["title"]); assert "preferred" in bare["flag"].lower()
+    assert all("different INR amounts" in x["flag"] for x in p if x["kind"] == "fact")
+    vague = next(x for x in p if x["kind"] == "guideline" and "professional" in x["body"]); assert "Vague" in vague["flag"]
+    assert not next(x for x in p if x["kind"] == "guideline" and "guaranteed" in x["body"])["flag"]
+
+
+def test_accepting_proposals_changes_reviews_and_validates_edits(c):
+    c.post("/api/import", json={"name": "guide.txt", "text": GUIDE}, headers=M)
+    p = props(c); bare = next(x for x in p if x["kind"] == "term" and not x["title"])
+    assert c.post(f"/api/proposals/{bare['id']}/accept", json={"title": "", "body": bare["body"], "value": bare["value"]}, headers=M).status_code == 400
+    assert c.post(f"/api/proposals/{bare['id']}/accept", json={"title": "NovaDesk", "body": bare["body"], "value": "Novadesk"}, headers=M).status_code == 200
+    assert c.post(f"/api/proposals/{bare['id']}/accept", json={"title": "NovaDesk", "body": "x", "value": "y"}, headers=M).status_code == 409   # already handled
+    v = new(c, "Try Novadesk today")
+    assert ("terminology", "contradicted") in rules(det(c, v))
+    fact = next(x for x in p if x["kind"] == "fact" and x["value"] == "599")
+    assert c.post(f"/api/proposals/{fact['id']}/accept", json={"title": fact["title"], "body": fact["body"], "pattern": "(", "value": "599"}, headers=M).status_code == 400  # bad regex
+    assert c.post(f"/api/proposals/{fact['id']}/accept", json={"title": fact["title"], "body": fact["body"], "pattern": fact["pattern"], "value": "599"}, headers=M).status_code == 200
+    v2 = new(c, "Plans from INR 499 per month")
+    assert ("fact", "conflict") in rules(det(c, v2))                            # two active sources disagree -> escalated, not guessed
+    other = next(x for x in props(c) if x["kind"] == "fact")
+    assert c.post(f"/api/proposals/{other['id']}/reject", headers=M).status_code == 200
+    assert other["id"] not in [x["id"] for x in props(c)]
+
+
+def test_accept_clean_only_activates_unflagged_complete_rules(c):
+    c.post("/api/import", json={"name": "guide.txt", "text": GUIDE}, headers=M)
+    n = c.post("/api/proposals/accept-clean", headers=M).json()["accepted"]
+    assert n == 2                                                                # palette + the unflagged 'guaranteed' guideline
+    left = props(c)
+    assert left and all(x["flag"] for x in left)
+    assert any(x["kind"] == "term" and x["title"] == "NovaDesk" and "already exists" in x["flag"] for x in left)  # duplicate stays for a human
+    srcs = c.get("/api/sources", headers=M).json()
+    assert any(s["origin"] == "guide.txt" and s["passage"] for s in srcs)       # provenance kept
+
+
+def test_import_pattern_matches_seeded_price_pattern(c):
+    seeded = next(s for s in c.get("/api/sources", headers=M).json() if s["kind"] == "fact")["pattern"]
+    assert main.INR_PAT == seeded
