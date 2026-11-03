@@ -297,3 +297,15 @@ def test_login_lists_both_demo_workspaces_and_me_reports_workspace(c):
     info = c.get("/api/info").json()
     assert {d["workspace"] for d in info["demo"]} == {"NovaDesk demo workspace", "Acme Studio demo workspace"} and info["db"] in ("sqlite", "postgresql")
     assert c.get("/api/me", headers=acme(c, "acme_manager")).json()["workspace"] == "Acme Studio demo workspace"
+
+
+def test_input_limits_and_file_type_checks(c):
+    assert c.post("/api/contents", json={"title": "t", "text": "x" * 50001}, headers=A).status_code == 400
+    assert c.post("/api/contents", json={"title": "t" * 121, "text": "ok"}, headers=A).status_code == 400
+    assert c.post("/api/contents", json={"title": "t", "text": "   "}, headers=A).status_code == 400
+    v = new(c, "short draft")
+    assert c.post(f"/api/versions/{v}/revise", json={"text": "y" * 50001}, headers=A).status_code == 400
+    ex = lambda name, data="aGk=": c.post("/api/extract", json={"name": name, "data": data}, headers=A)
+    assert ex("virus.exe").status_code == 400 and ex("notes.txt").status_code == 200
+    assert ex("broken.pdf").status_code == 400 and ex("big.txt", "A" * 14_000_001).status_code == 413
+    assert ex("empty.txt", "").status_code == 400                                  # nothing to extract

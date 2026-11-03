@@ -533,7 +533,8 @@ def contents(x_token: str = Header("")):
 @app.post("/api/contents")
 def new_content(b: New, x_token: str = Header("")):
     u = need(x_token, "creator", "manager")
-    if not b.text.strip(): raise HTTPException(400, "Empty draft")
+    if not b.text.strip(): raise HTTPException(400, "Empty draft. Paste or upload some text first.")
+    if len(b.text) > 50000 or len(b.title) > 120: raise HTTPException(400, "Draft too long (max 50,000 characters, title max 120).")
     cid = q("INSERT INTO contents(title,purpose,author,ws) VALUES(?,?,?,?)", (b.title or "Untitled", b.purpose, u, WS(x_token)), w=True)
     vid = q("INSERT INTO versions(content_id,n,text,author) VALUES(?,1,?,?)", (cid, b.text, u), w=True)
     run(vid, b.text); log(u, "content_created", f"v{vid}"); return {"vid": vid}
@@ -564,6 +565,7 @@ def revise(vid: int, b: Txt, x_token: str = Header("")):
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can revise")
     lt = latest(v)
     if lt["id"] != vid: raise HTTPException(409, f"A newer version (v{lt['n']}) exists. Open the latest version to edit.")
+    if len(b.text) > 50000: raise HTTPException(400, "Draft too long (max 50,000 characters).")
     if b.text.strip() == v["text"].strip(): raise HTTPException(400, "No changes to save. Edit the text or apply a suggestion first.")
     n = q("SELECT MAX(n) m FROM versions WHERE content_id=?", (v["content_id"],), one=True)["m"] + 1
     nid = q("INSERT INTO versions(content_id,n,text,author) VALUES(?,?,?,?)", (v["content_id"], n, b.text, u), w=True)
@@ -655,6 +657,8 @@ class Up(BaseModel):
 @app.post("/api/extract")
 def extract(b: Up, x_token: str = Header("")):
     need(x_token, "creator", "manager")
+    if not b.name.lower().endswith((".pdf", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg")): raise HTTPException(400, "Unsupported file type. Use PDF, DOCX, TXT, MD, PNG or JPG.")
+    if len(b.data) > 14_000_000: raise HTTPException(413, "File is too large (max about 10 MB).")
     try:
         raw = base64.b64decode(b.data)
         if b.name.lower().endswith(".pdf"):
@@ -753,15 +757,19 @@ textarea{min-height:120px}.mut{color:var(--mut);font-size:13px}.badge{border:1px
 .card{box-shadow:0 1px 3px rgba(0,0,0,.08)}button:hover{border-color:var(--acc)}
 blockquote{margin:6px 0;padding-left:8px;border-left:3px solid var(--acc);color:var(--mut)}.item{cursor:pointer}.item:hover{border-color:var(--acc)}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left}footer{padding:12px 16px;color:var(--mut);font-size:12px}
-</style></head><body>
+.btnlike{display:inline-block;padding:5px 10px;border:1px solid var(--line);background:var(--card);border-radius:6px;cursor:pointer}
+body.in .hero{padding:8px 16px}body.in .hero h1{font-size:18px}body.in .hero p{display:none}body.in .steps span{font-size:11px;padding:1px 9px}
+body.busy button{pointer-events:none;opacity:.6}</style></head><body>
 <header><b>BrandLess</b><nav id="nav"></nav><span style="flex:1"></span><span id="who" class="mut"></span></header>
 <section class="hero"><div><h1>Keep the message. Check the promise.</h1><p>BrandLess reviews content against approved brand facts and guidelines before publication, explains every finding with its source, and leaves the decision to people.</p><div class="steps"><span>1 Approve sources</span><span>2 Review draft</span><span>3 Resolve findings</span><span>4 Human approval</span><span>5 Learn from disputes</span></div></div></section>
 <main id="m"></main><footer id="ft"></footer>
 <script>
 let TOKEN=localStorage.t||'',ME=null,INFO={},CUR=null,FIX={},DRAFT={},SAVED={};const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(p,m='GET',b){let r,j={};try{r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json','X-Token':TOKEN},body:b?JSON.stringify(b):undefined});j=await r.json()}catch(e){if(!r){alert('Cannot reach the server. Please retry.');throw 0}}if(r.status==401&&p!='/login'){TOKEN='';localStorage.removeItem('t');loginView();throw 0}if(!r.ok){alert(j.detail||'Something went wrong. Please try again.');throw 0}return j}
+let BUSY=false;
+async function api(p,m='GET',b){if(m!='GET'){if(BUSY)throw 0;BUSY=true;document.body.classList.add('busy')}let r,j={};try{r=await fetch('/api'+p,{method:m,headers:{'Content-Type':'application/json','X-Token':TOKEN},body:b?JSON.stringify(b):undefined});j=await r.json()}catch(e){if(!r){alert('Cannot reach the server. Please retry.');throw 0}}finally{if(m!='GET'){BUSY=false;document.body.classList.remove('busy')}}if(r.status==401&&p!='/login'){TOKEN='';localStorage.removeItem('t');loginView();throw 0}if(!r.ok){if(!(m=='GET'&&r.status==404))alert(j.detail||'Something went wrong. Please try again.');throw 0}return j}
 const LBL={contradicted:'CONTRADICTED',not_verifiable:'NOT VERIFIABLE',conflict:'SOURCE CONFLICT',scope_check:'CHECK SCOPE',suggestion:'SUGGESTION',not_assessed:'NOT ASSESSED'};
+const EMPTY={creator:'<p class="mut">No drafts yet. Click + New draft.</p>',manager:'<p class="mut">No drafts yet. Managers can also create drafts, or manage rules in the Sources tab.</p>',reviewer:'<p class="mut">Drafts submitted for approval will appear here.</p>'};
 const SAMPLE2='Subject: Big news!\nHi team, NovaDesk is the best and fastest helpdesk, risk-free at Rs. 999 per month.\n![](banner.png)';
 const SAMPLE='Meet Nova Desk! Nova Desk starts at INR 299/month and every customer is guaranteed to double revenue in 7 days.\n\n![](hero.png)\n[text:#999999 on:#ffffff] Limited offer\n[colors: #FF00FF, #2F6FED]';
 async function boot(){INFO=await (await fetch('/api/info')).json();
@@ -769,13 +777,13 @@ $('#ft').textContent=INFO.ai=='on'?`AI disclosure: tone/messaging analysis sends
 $('#ft').textContent+=' Storage: '+(INFO.db=='postgresql'?'PostgreSQL (persistent).':'SQLite (demo data resets when the host restarts).');
 if(!TOKEN)return loginView();try{await start()}catch(e){}}
 async function start(){ME=await api('/me');$('#who').innerHTML=`${esc(ME.name)} (${ME.role}) &middot; ${esc(ME.workspace||'')} <button onclick="logout()">Sign out</button>`;
-$('#nav').innerHTML=[['c','Content'],['s','Sources'],['i','Insights'],['e','Evaluation']].map(([k,t])=>`<button id="t${k}" onclick="tab('${k}')">${t}</button>`).join('');CUR=null;tab('c')}
-function loginView(){ME=null;$('#nav').innerHTML='';$('#who').innerHTML='';
+$('#nav').innerHTML=[['c','Content'],['s','Sources'],['i','Insights'],['e','Evaluation']].map(([k,t])=>`<button id="t${k}" onclick="tab('${k}')">${t}</button>`).join('');document.body.classList.add('in');CUR=+localStorage.cur||null;tab(localStorage.tab||'c')}
+function loginView(){document.body.classList.remove('in');localStorage.removeItem('cur');ME=null;$('#nav').innerHTML='';$('#who').innerHTML='';
 $('#m').innerHTML=`<div class="card" style="max-width:520px;margin:20px auto"><h3>Sign in to BrandLess</h3><input id="lu" placeholder="Username" autocomplete="username"><input id="lp" type="password" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key=='Enter')login()"><button onclick="login()">Sign in</button>${(INFO.demo||[]).length?`<p class="mut"><b>Demo accounts</b> (fictional data only). Click a row to fill it in. Creator drafts and responds; Manager manages sources; Reviewer approves. Each workspace is isolated: its own sources, drafts and audit trail.</p><table><tr><th>Username</th><th>Password</th><th>Role</th><th>Workspace</th></tr>${INFO.demo.map(d=>`<tr style="cursor:pointer" onclick="$('#lu').value='${esc(d.username)}';$('#lp').value='${esc(d.password)}'"><td>${esc(d.username)}</td><td>${esc(d.password)}</td><td>${esc(d.role)}</td><td>${esc(d.workspace||'')}</td></tr>`).join('')}</table>`:''}</div>`}
 async function login(){let r;try{r=await api('/login','POST',{username:$('#lu').value,password:$('#lp').value})}catch(e){return}TOKEN=r.token;localStorage.t=TOKEN;try{await start()}catch(e){}}
 async function logout(){try{await api('/logout','POST')}catch(e){}TOKEN='';localStorage.removeItem('t');loginView()}
 const SAMPLEG='Brand voice: Use "NovaDesk" instead of "Nova Desk". Never use "Novadesk".\nThe starting price is INR 599 per month. Annual plans are INR 499 per month.\nOur colours are #1F2A44, #2F6FED and #FFFFFF.\nAlways keep a professional and friendly tone.\nYou must not promise guaranteed results.';
-const IMPORT_HTML=`<div class="card"><h4>Import a guideline document</h4><p class="mut">Upload a PDF, DOCX or TXT (or paste text). BrandLess proposes draft rules with the source passage and flags vague or conflicting lines. Nothing becomes active until you accept it.</p><input type="file" id="gf" accept=".pdf,.docx,.txt,.md" onchange="gfile(this)"><input id="gn" placeholder="Document name"><textarea id="gt" placeholder="...or paste guideline text here"></textarea><button onclick="$('#gt').value=SAMPLEG;$('#gn').value='Sample brand guide'">Load sample guideline</button> <button onclick="imp()">Analyse guideline</button></div>`;
+const IMPORT_HTML=`<div class="card"><h4>Import a guideline document</h4><p class="mut">Upload a PDF, DOCX or TXT (or paste text). BrandLess proposes draft rules with the source passage and flags vague or conflicting lines. Nothing becomes active until you accept it.</p><label class="btnlike">Upload guideline (PDF, DOCX, TXT)<input type="file" id="gf" accept=".pdf,.docx,.txt,.md" onchange="gfile(this)" hidden></label><input id="gn" placeholder="Document name"><textarea id="gt" placeholder="...or paste guideline text here"></textarea><button onclick="$('#gt').value=SAMPLEG;$('#gn').value='Sample brand guide'">Load sample guideline</button> <button onclick="imp()">Analyse guideline</button></div>`;
 function gfile(i){const f=i.files[0];if(!f)return;const r=new FileReader();r.onload=async()=>{const j=await api('/extract','POST',{name:f.name,data:r.result.split(',')[1]});$('#gt').value=j.text;if(!$('#gn').value)$('#gn').value=f.name};r.readAsDataURL(f)}
 async function imp(){const j=await api('/import','POST',{name:$('#gn').value||'pasted guideline',text:$('#gt').value});alert(j.created+' draft rule(s) proposed. Review them below; nothing is active until you accept.');loadProps()}
 async function loadProps(){const l=await api('/proposals');$('#props').innerHTML=l.length?`<h4>Proposed rules (${l.length}) <button onclick="accClean()">Accept all without warnings</button></h4>`+l.map(p=>`<div class="card"><span class="badge">${p.kind.toUpperCase()}</span> <span class="mut">from ${esc(p.doc)}</span>${p.flag?`<p style="color:#b54708"><b>Needs attention:</b> ${esc(p.flag)}</p>`:''}<blockquote>${esc(p.passage)}</blockquote><input id="p${p.id}t" value="${esc(p.title)}" placeholder="${p.kind=='term'?'Preferred wording':'Title'}"><textarea id="p${p.id}b" style="min-height:50px">${esc(p.body)}</textarea>${p.kind=='fact'?`<input id="p${p.id}p" value="${esc(p.pattern||'')}" placeholder="Pattern">`:''}${p.kind!='guideline'?`<input id="p${p.id}v" value="${esc(p.value||'')}" placeholder="${p.kind=='term'?'Banned wordings (separate with |)':'Value'}">`:''}<button onclick="accP(${p.id})">Accept and activate</button> <button onclick="rejP(${p.id})">Reject</button></div>`).join(''):'<p class="mut">No pending proposals.</p>'}
@@ -785,13 +793,13 @@ async function accClean(){const j=await api('/proposals/accept-clean','POST');al
 async function delC(id){if(!confirm('Delete this draft and all its versions? This cannot be undone.'))return;await api('/contents/'+id,'DELETE');CUR=null;tab('c')}
 async function delS(id){if(!confirm('Delete this source?'))return;await api('/sources/'+id,'DELETE');srcs()}
 async function exportAudit(){const j=await api('/audit/export');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(j,null,2)],{type:'application/json'}));a.download='audit-trail.json';a.click()}
-function tab(k){['c','s','i','e'].forEach(x=>$('#t'+x).classList.toggle('on',x==k));({c:content,s:srcs,i:ins,e:evl})[k]()}
+function tab(k){localStorage.tab=k;['c','s','i','e'].forEach(x=>$('#t'+x).classList.toggle('on',x==k));({c:content,s:srcs,i:ins,e:evl})[k]()}
 async function content(){const l=await api('/contents');
-$('#m').innerHTML=`<div class="g"><div><button onclick="newForm()">+ New draft</button>${l.map(x=>`<div class="card item" onclick="openV(${x.vid})"><b>${esc(x.title)}</b><br><span class="mut">v${x.n} | ${x.status} | ${esc(x.author)}</span></div>`).join('')||'<p class="mut">Nothing here yet.</p>'}</div><div id="p"></div></div>`;
-CUR?openV(CUR):newForm()}
-function newForm(){CUR=null;$('#p').innerHTML=`<div class="card"><h3>Submit a draft for review</h3><p class="mut"><b>Try it in 3 steps:</b> 1) Load a sample (or upload a PDF/TXT) and click Run review. 2) Respond to each finding. 3) Submit, then sign out and sign in as Rina (reviewer; credentials are on the sign-in page) to approve.</p><input id="ti" placeholder="Title (e.g. Product launch post)"><input id="pu" placeholder="Purpose / audience (kept with the draft)"><textarea id="tx" placeholder="Paste your text here"></textarea><button onclick="$('#tx').value=SAMPLE;$('#ti').value='NovaDesk launch post';$('#pu').value='Announce to existing customers'">Load sample draft</button> <button onclick="$('#tx').value=SAMPLE2;$('#ti').value='Launch email';$('#pu').value='Email to leads'">Load email sample</button> <input type="file" id="fl" accept=".pdf,.docx,.txt,.md,.png,.jpg,.jpeg" onchange="upl(this)" style="width:auto"> <button onclick="create()">Run review</button><p class="mut">Checks: terminology, approved facts, promotional claims, tone (if AI on), alt text and contrast (write [text:#hex on:#hex]).</p></div>`}
-async function create(){const r=await api('/contents','POST',{title:$('#ti').value,purpose:$('#pu').value,text:$('#tx').value});CUR=r.vid;content()}
-async function openV(id){CUR=id;const d=await api('/versions/'+id),v=d.version,me=ME.username,mine=v.cauthor==me,ed=mine&&d.latest&&['draft','changes_requested'].includes(v.status);FIX={};SAVED[id]=v.text;const df=v.n>1?await api('/versions/'+id+'/diff'):null;
+$('#m').innerHTML=`<div class="g"><div>${ME.role=='reviewer'?'':'<button onclick="newForm()">+ New draft</button>'}${l.map(x=>`<div class="card item" onclick="openV(${x.vid})"><b>${esc(x.title)}</b><br><span class="mut">v${x.n} | ${x.status} | ${esc(x.author)}</span></div>`).join('')||EMPTY[ME.role]}</div><div id="p"></div></div>`;
+CUR?openV(CUR).catch(()=>{CUR=null;localStorage.removeItem('cur');newForm()}):newForm()}
+function newForm(){CUR=null;localStorage.removeItem('cur');if(ME.role=='reviewer'){$('#p').innerHTML='<div class="card"><h3>Review queue</h3><p>Open a submitted draft from the list on the left to review its findings, discuss, and approve or request changes.</p></div>';return}$('#p').innerHTML=`<div class="card"><h3>Submit a draft for review</h3><p class="mut"><b>Try it in 3 steps:</b> 1) Load a sample (or upload a PDF/TXT) and click Run review. 2) Respond to each finding. 3) Submit, then sign out and sign in as Rina (reviewer; credentials are on the sign-in page) to approve.</p><input id="ti" placeholder="Title (e.g. Product launch post)"><input id="pu" placeholder="Purpose / audience (kept with the draft)"><textarea id="tx" placeholder="Paste your text here"></textarea><button onclick="$('#tx').value=SAMPLE;$('#ti').value='NovaDesk launch post';$('#pu').value='Announce to existing customers'">Load sample draft</button> <button onclick="$('#tx').value=SAMPLE2;$('#ti').value='Launch email';$('#pu').value='Email to leads'">Load email sample</button> <label class="btnlike">Upload PDF, DOCX, image or TXT<input type="file" id="fl" accept=".pdf,.docx,.txt,.md,.png,.jpg,.jpeg" onchange="upl(this)" hidden></label> <button onclick="create()">Run review</button><p class="mut">Checks: terminology, approved facts, promotional claims, tone (if AI on), alt text and contrast (write [text:#hex on:#hex]).</p></div>`}
+async function create(){if(!$('#tx').value.trim())return alert('Paste or upload some text first.');const r=await api('/contents','POST',{title:$('#ti').value,purpose:$('#pu').value,text:$('#tx').value});CUR=r.vid;content()}
+async function openV(id){CUR=id;localStorage.cur=id;const d=await api('/versions/'+id),v=d.version,me=ME.username,mine=v.cauthor==me,ed=mine&&d.latest&&['draft','changes_requested'].includes(v.status);FIX={};SAVED[id]=v.text;const df=v.n>1?await api('/versions/'+id+'/diff'):null;
 const rev=!mine&&v.status=='in_review'&&ME.role!='creator';
 $('#p').innerHTML=`<div class="card"><h3>${esc(v.title)} <span class="badge">v${v.n}: ${v.status.toUpperCase()}</span></h3><div class="mut">Purpose: ${esc(v.purpose)||'-'} | Author: ${esc(v.cauthor)} | AI layer: ${v.ai} ${v.approved_by?'| Approved by '+esc(v.approved_by):''} ${v.note?'| Note: '+esc(v.note):''}</div>
 <div class="mut">Versions: ${d.history.map(h=>`<a href="#" onclick="openV(${h.id});return false">v${h.n} (${h.status})</a>`).join(' | ')}</div>
