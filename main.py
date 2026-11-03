@@ -12,10 +12,51 @@ MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
 app = FastAPI(title="BrandLess")
 DEMO_PW = os.getenv("DEMO_PASSWORD", "demo123")
 SHOW_DEMO = os.getenv("SHOW_DEMO", "1") != "0"   # demo credentials are shown on the sign-in page for judges; set SHOW_DEMO=0 in real use
-DEMO_USERS = [("asha", "Asha", "creator"), ("manoj", "Manoj", "manager"), ("rina", "Rina", "reviewer")]
+DEMO_WS = 1   # the NovaDesk demo workspace; the built-in evaluation always runs against its library
+DEMO_USERS = [("asha", "Asha", "creator", 1), ("manoj", "Manoj", "manager", 1), ("rina", "Rina", "reviewer", 1),
+              ("acme_creator", "Acme Creator", "creator", 2), ("acme_manager", "Acme Manager", "manager", 2), ("acme_reviewer", "Acme Reviewer", "reviewer", 2)]
+WS_NAMES = {1: "NovaDesk demo workspace", 2: "Acme Studio demo workspace"}
+_P = r"(?:INR|₹|Rs\.?)\s?([\d,]+)"
+SEEDS = {1: [("guideline", "Tone guide G1", "Avoid exaggerated or absolute promises such as guaranteed results. Keep a confident, plain, helpful tone.", None, None),
+             ("term", "NovaDesk", "The product name is one word: NovaDesk.", None, "Nova Desk|Nova-Desk|Novadesk"),
+             ("fact", "Starting price", "Starting price is INR 499/month (Product Facts v2).", _P, "499"),
+             ("evidence", "Case study: Acme Ltd", "Acme Ltd saw revenue double in 90 days after adopting NovaDesk. This is a single customer result.", None, None),
+             ("asset", "Brand palette", "Approved brand colours. Colours far from these are flagged as off-brand.", None, "#1F2A44|#2F6FED|#FFFFFF|#B54708")],
+         2: [("guideline", "Voice guide", "Be warm and direct. Never promise exact delivery dates.", None, None),
+             ("term", "Zephyr", "The product name is Zephyr, never Zefyr.", None, "Zefyr|Zephyr App"),
+             ("fact", "Starting price", "Starting price is INR 799/month (Acme price list).", _P, "799"),
+             ("evidence", "Case study: Beacon Co", "Zephyr cut onboarding time from 5 days to 2 days for Beacon Co. This is a single customer result.", None, None),
+             ("asset", "Brand palette", "Approved Acme colours.", None, "#0B3D2E|#F4B942|#FFFFFF")]}
+
+
+PG = os.getenv("DATABASE_URL", "").strip()
+ID_TABLES = {"sources", "contents", "versions", "findings", "comments", "audit", "proposals", "workspaces"}
+if PG:
+    try:
+        import psycopg2, psycopg2.extras, psycopg2.pool
+        _pool = psycopg2.pool.ThreadedConnectionPool(1, 8, PG.replace("postgres://", "postgresql://", 1))
+    except Exception as e:  # never leave the site dead: fall back to SQLite and say so
+        print("PostgreSQL unavailable, falling back to SQLite:", e); PG = ""
+
+
+def qpg(sql, a, one, w):
+    sql = sql.replace("?", "%s").replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY").replace(" REAL", " DOUBLE PRECISION").replace("ADD COLUMN ", "ADD COLUMN IF NOT EXISTS ")
+    m = re.match(r"\s*INSERT INTO (\w+)", sql); ret = bool(w and m and m.group(1) in ID_TABLES)
+    if ret: sql += " RETURNING id"
+    c = _pool.getconn()
+    try:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, a)
+            r = cur.fetchone()["id"] if ret else (None if w else [dict(x) for x in cur.fetchall()])
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally: _pool.putconn(c)
+    return r if w else ((r[0] if r else None) if one else r)
 
 
 def q(sql, a=(), one=False, w=False):
+    if PG: return qpg(sql, a, one, w)
     c = sqlite3.connect(DB); c.row_factory = sqlite3.Row
     cur = c.execute(sql, a)
     if w:
@@ -25,12 +66,8 @@ def q(sql, a=(), one=False, w=False):
 
 
 def log(who, action, detail=""):
-    q("INSERT INTO audit(ts,who,action,detail) VALUES(?,?,?,?)", (time.time(), who, action, detail), w=True)
-
-
-def ensure_asset():
-    if not q("SELECT 1 FROM sources WHERE kind='asset'", one=True):
-        q("INSERT INTO sources(kind,title,body,value) VALUES('asset','Brand palette','Approved brand colours. Colours far from these are flagged as off-brand.','#1F2A44|#2F6FED|#FFFFFF|#B54708')", w=True)
+    u = q("SELECT ws FROM users WHERE username=?", (who,), one=True)
+    q("INSERT INTO audit(ts,who,action,detail,ws) VALUES(?,?,?,?,?)", (time.time(), who, action, detail, u["ws"] if u else 0), w=True)
 
 
 @app.on_event("startup")
@@ -50,17 +87,16 @@ def init():
         except sqlite3.OperationalError: pass
     q("""CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY, version_id INT, who TEXT, text TEXT)""", w=True)
     q("""CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, who TEXT, action TEXT, detail TEXT)""", w=True)
-    if not q("SELECT 1 FROM sources LIMIT 1", one=True):
-        seed = [
-            ("guideline", "Tone guide G1", "Avoid exaggerated or absolute promises such as guaranteed results. Keep a confident, plain, helpful tone.", None, None),
-            ("term", "NovaDesk", "The product name is one word: NovaDesk.", None, "Nova Desk|Nova-Desk|Novadesk"),
-            ("fact", "Starting price", "Starting price is INR 499/month (Product Facts v2).", r"(?:INR|₹|Rs\.?)\s?([\d,]+)", "499"),
-            ("evidence", "Case study: Acme Ltd", "Acme Ltd saw revenue double in 90 days after adopting NovaDesk. This is a single customer result.", None, None),
-        ]
-        for s in seed:
-            q("INSERT INTO sources(kind,title,body,pattern,value) VALUES(?,?,?,?,?)", s, w=True)
-    ensure_asset()
+    q("CREATE TABLE IF NOT EXISTS workspaces(id INTEGER PRIMARY KEY, name TEXT)", w=True)
+    for t in ("sources", "contents", "proposals", "audit"):
+        try: q(f"ALTER TABLE {t} ADD COLUMN ws INT DEFAULT 1", w=True)
+        except sqlite3.OperationalError: pass
     ensure_users()
+    for i, name in WS_NAMES.items():
+        if not q("SELECT 1 FROM workspaces WHERE id=?", (i,), one=True): q("INSERT INTO workspaces(id,name) VALUES(?,?)", (i, name), w=True)
+        if not q("SELECT 1 FROM sources WHERE ws=?", (i,), one=True):
+            for k, t, bd, p, v in SEEDS[i]:
+                q("INSERT INTO sources(kind,title,body,pattern,value,ws) VALUES(?,?,?,?,?,?)", (k, t, bd, p, v, i), w=True)
 
 
 def hpw(pw, salt):
@@ -69,11 +105,13 @@ def hpw(pw, salt):
 
 def ensure_users():
     q("CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, name TEXT, role TEXT, salt TEXT, pw TEXT)", w=True)
+    try: q("ALTER TABLE users ADD COLUMN ws INT DEFAULT 1", w=True)
+    except sqlite3.OperationalError: pass
     q("CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, username TEXT, exp REAL)", w=True)
-    if not q("SELECT 1 FROM users LIMIT 1", one=True):
-        for u, n, r in DEMO_USERS:
+    for u, n, r, ws in DEMO_USERS:
+        if not q("SELECT 1 FROM users WHERE username=?", (u,), one=True):
             salt = secrets.token_hex(16)
-            q("INSERT INTO users(username,name,role,salt,pw) VALUES(?,?,?,?,?)", (u, n, r, salt, hpw(DEMO_PW, salt)), w=True)
+            q("INSERT INTO users(username,name,role,salt,pw,ws) VALUES(?,?,?,?,?,?)", (u, n, r, salt, hpw(DEMO_PW, salt), ws), w=True)
 
 
 def who(x):
@@ -88,6 +126,17 @@ def need(x, *roles):
     u, r = who(x)
     if r not in roles: raise HTTPException(403, f"A {r} cannot do this")
     return u
+
+
+def WS(x):
+    u, _ = who(x)
+    return q("SELECT ws FROM users WHERE username=?", (u,), one=True)["ws"]
+
+
+def own(table, i, ws):  # a record from another workspace looks exactly like a missing one
+    r = q(f"SELECT * FROM {table} WHERE id=? AND ws=?", (i, ws), one=True)
+    if not r: raise HTTPException(404, "Not found")
+    return r
 
 
 # ---------------- review engine ----------------
@@ -129,8 +178,8 @@ def ai_review(text, guides):
     return res, "on"
 
 
-def review(text, use_ai=True):
-    srcs = q("SELECT * FROM sources WHERE active=1")
+def review(text, use_ai=True, ws=1):
+    srcs = q("SELECT * FROM sources WHERE active=1 AND ws=?", (ws,))
     by = lambda k: [s for s in srcs if s["kind"] == k]
     out = []
     for t in by("term"):  # exact terminology
@@ -208,7 +257,7 @@ def support(f):
         ok = f["span"] in (s["value"] or "").split("|") and bool(s["title"]) and f.get("fix") == s["title"]
         return ("verified", "The cited term source lists this wording as banned and names the preferred form.") if ok else ("unsupported", "The cited source does not list this wording as banned with that preferred name.")
     if r == "fact" and st == "conflict" and s:
-        vals = {x["value"] for x in q("SELECT value FROM sources WHERE active=1 AND kind='fact' AND pattern=?", (s["pattern"],))}
+        vals = {x["value"] for x in q("SELECT value FROM sources WHERE active=1 AND kind='fact' AND pattern=? AND ws=?", (s["pattern"], s["ws"]))}
         return ("verified", "Two active sources give different values: " + ", ".join(sorted(vals)) + ".") if len(vals) > 1 else ("unsupported", "Only one value exists for this pattern, so there is no conflict.")
     if r == "fact" and s:
         nums = {n.replace(",", "") for n in NUM.findall(s["body"] or "")}
@@ -237,7 +286,8 @@ def assess(res):
 
 
 def run(vid, text):
-    res, status = review(text); assess(res)
+    ws = q("SELECT c.ws FROM versions v JOIN contents c ON c.id=v.content_id WHERE v.id=?", (vid,), one=True)["ws"]
+    res, status = review(text, ws=ws); assess(res)
     q("UPDATE versions SET ai=? WHERE id=?", (status, vid), w=True)
     groups = {}  # identical finding (same rule/span/source/fix) -> one card with an occurrence count
     for f in res:
@@ -273,7 +323,8 @@ class Login(BaseModel):
 @app.get("/api/info")
 def info():
     return {"ai": "on" if os.getenv("ANTHROPIC_API_KEY") else "off", "model": MODEL,
-            "demo": [{"username": u, "password": DEMO_PW, "role": r} for u, _, r in DEMO_USERS] if SHOW_DEMO else []}
+            "db": "postgresql" if PG else "sqlite",
+            "demo": [{"username": u, "password": DEMO_PW, "role": r, "workspace": WS_NAMES[w]} for u, _, r, w in DEMO_USERS] if SHOW_DEMO else []}
 
 
 @app.post("/api/login")
@@ -297,12 +348,13 @@ def logout(x_token: str = Header("")):
 @app.get("/api/me")
 def me(x_token: str = Header("")):
     u, r = who(x_token)
-    return {"username": u, "role": r, "name": q("SELECT name FROM users WHERE username=?", (u,), one=True)["name"]}
+    x = q("SELECT name,ws FROM users WHERE username=?", (u,), one=True)
+    return {"username": u, "role": r, "name": x["name"], "workspace": WS_NAMES.get(x["ws"], "")}
 
 
 @app.delete("/api/sources/{sid}")
 def del_source(sid: int, x_token: str = Header("")):
-    u = need(x_token, "manager")
+    u = need(x_token, "manager"); own("sources", sid, WS(x_token))
     n = q("SELECT COUNT(*) n FROM findings WHERE source_id=?", (sid,), one=True)["n"]
     if n: raise HTTPException(409, f"This source is cited by {n} finding(s). Deactivate it instead so the history stays intact.")
     q("DELETE FROM sources WHERE id=?", (sid,), w=True); log(u, "source_deleted", str(sid)); return {"ok": True}
@@ -311,8 +363,7 @@ def del_source(sid: int, x_token: str = Header("")):
 @app.delete("/api/contents/{cid}")
 def del_content(cid: int, x_token: str = Header("")):
     u, r = who(x_token)
-    c = q("SELECT * FROM contents WHERE id=?", (cid,), one=True)
-    if not c: raise HTTPException(404, "Not found")
+    c = own("contents", cid, WS(x_token))
     vs = q("SELECT id,status FROM versions WHERE content_id=?", (cid,))
     if r != "manager" and (c["author"] != u or any(v["status"] == "approved" for v in vs)):
         raise HTTPException(403, "Only the author can delete their own unapproved draft; a manager can delete any")
@@ -328,7 +379,7 @@ VAGUE = re.compile(r"\b(appropriate|professional|friendly|as needed|where possib
 QT = "[\"\u201c\u2018']([^\"\u201d\u2019']{2,40})[\"\u201d\u2019']"
 
 
-def propose(text):
+def propose(text, ws=1):
     out, prices = [], {}
     sents = [x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+", text) if x.strip()]
     for s in sents:
@@ -360,7 +411,7 @@ def propose(text):
         vals = sorted({p["value"] for p in ps})
         if len(vals) > 1:
             for p in ps: p["flag"] = f"The document lists different {key} amounts ({', '.join(vals)}). Confirm which is approved. " + p["flag"]
-    old = q("SELECT id,kind,title,value,pattern FROM sources WHERE active=1")
+    old = q("SELECT id,kind,title,value,pattern FROM sources WHERE active=1 AND ws=?", (ws,))
     for p in out:
         if p["kind"] == "fact":
             for o in old:
@@ -391,7 +442,7 @@ def make_source(p, title, body, pat, val, u):
         except re.error: ok = False
         if not ok: raise HTTPException(400, "The pattern must be a valid regular expression with exactly one capture group.")
     if k == "asset" and not all(re.fullmatch(r"#[0-9a-fA-F]{6}", x) for x in val.split("|")): raise HTTPException(400, "Palette values must be hex colours separated by |.")
-    sid = q("INSERT INTO sources(kind,title,body,pattern,value,passage,origin) VALUES(?,?,?,?,?,?,?)", (k, title or p["title"], body, pat if k == "fact" else None, val, p["passage"], p["doc"]), w=True)
+    sid = q("INSERT INTO sources(kind,title,body,pattern,value,passage,origin,ws) VALUES(?,?,?,?,?,?,?,?)", (k, title or p["title"], body, pat if k == "fact" else None, val, p["passage"], p["doc"], p["ws"]), w=True)
     q("UPDATE proposals SET status='accepted', source_id=? WHERE id=?", (sid, p["id"]), w=True)
     log(u, "proposal_accepted", f"#{p['id']} -> source #{sid} ({k}) from {p['doc']}"); return sid
 
@@ -400,22 +451,22 @@ def make_source(p, title, body, pat, val, u):
 def import_guideline(b: Imp, x_token: str = Header("")):
     u = need(x_token, "manager")
     if not b.text.strip(): raise HTTPException(400, "Paste or upload some guideline text first.")
-    ps = propose(b.text[:50000]); seen = set(); n = 0
+    ws = WS(x_token); ps = propose(b.text[:50000], ws); seen = set(); n = 0
     for p in ps:
         k = (p["kind"], p["title"], p.get("value"), p["body"])
         if k in seen: continue
         seen.add(k); n += 1
-        q("INSERT INTO proposals(doc,kind,title,body,pattern,value,passage,flag) VALUES(?,?,?,?,?,?,?,?)", (b.name[:80], p["kind"], p["title"], p["body"], p.get("pattern"), p.get("value"), p["passage"], (p.get("flag") or "").strip() or None), w=True)
+        q("INSERT INTO proposals(doc,kind,title,body,pattern,value,passage,flag,ws) VALUES(?,?,?,?,?,?,?,?,?)", (b.name[:80], p["kind"], p["title"], p["body"], p.get("pattern"), p.get("value"), p["passage"], (p.get("flag") or "").strip() or None, ws), w=True)
     log(u, "guideline_imported", f"{b.name}: {n} proposed rules"); return {"created": n}
 
 
 @app.get("/api/proposals")
 def proposals(x_token: str = Header("")):
-    need(x_token, "manager"); return q("SELECT * FROM proposals WHERE status='pending' ORDER BY id")
+    need(x_token, "manager"); return q("SELECT * FROM proposals WHERE status='pending' AND ws=? ORDER BY id", (WS(x_token),))
 
 
-def pending(pid):
-    p = q("SELECT * FROM proposals WHERE id=?", (pid,), one=True)
+def pending(pid, ws):
+    p = q("SELECT * FROM proposals WHERE id=? AND ws=?", (pid, ws), one=True)
     if not p: raise HTTPException(404, "Not found")
     if p["status"] != "pending": raise HTTPException(409, "This proposal was already handled.")
     return p
@@ -423,20 +474,20 @@ def pending(pid):
 
 @app.post("/api/proposals/{pid}/accept")
 def accept_proposal(pid: int, b: Pr, x_token: str = Header("")):
-    u = need(x_token, "manager"); p = pending(pid)
+    u = need(x_token, "manager"); p = pending(pid, WS(x_token))
     return {"source_id": make_source(p, b.title.strip(), b.body.strip(), (b.pattern or "").strip() or None, (b.value or "").strip() or None, u)}
 
 
 @app.post("/api/proposals/{pid}/reject")
 def reject_proposal(pid: int, x_token: str = Header("")):
-    u = need(x_token, "manager"); pending(pid)
+    u = need(x_token, "manager"); pending(pid, WS(x_token))
     q("UPDATE proposals SET status='rejected' WHERE id=?", (pid,), w=True); log(u, "proposal_rejected", str(pid)); return {"ok": True}
 
 
 @app.post("/api/proposals/accept-clean")
 def accept_clean(x_token: str = Header("")):
     u = need(x_token, "manager"); n = 0
-    for p in q("SELECT * FROM proposals WHERE status='pending' AND flag IS NULL ORDER BY id"):
+    for p in q("SELECT * FROM proposals WHERE status='pending' AND flag IS NULL AND ws=? ORDER BY id", (WS(x_token),)):
         if p["kind"] == "term" and not p["title"]: continue
         make_source(p, p["title"], p["body"], p["pattern"], p["value"], u); n += 1
     return {"accepted": n}
@@ -445,12 +496,12 @@ def accept_clean(x_token: str = Header("")):
 @app.get("/api/audit/export")
 def audit_export(x_token: str = Header("")):
     need(x_token, "manager")
-    return {"exported_at": time.time(), "events": q("SELECT ts,who,action,detail FROM audit ORDER BY id")}
+    return {"exported_at": time.time(), "events": q("SELECT ts,who,action,detail FROM audit WHERE ws=? ORDER BY id", (WS(x_token),))}
 
 
 @app.get("/api/sources")
 def sources(x_token: str = Header("")):
-    who(x_token); return q("SELECT * FROM sources ORDER BY id")
+    who(x_token); return q("SELECT * FROM sources WHERE ws=? ORDER BY id", (WS(x_token),))
 
 
 @app.post("/api/sources")
@@ -460,13 +511,13 @@ def add_source(s: Src, x_token: str = Header("")):
     if s.pattern:
         try: re.compile(s.pattern)
         except re.error: raise HTTPException(400, "Invalid pattern")
-    i = q("INSERT INTO sources(kind,title,body,pattern,value) VALUES(?,?,?,?,?)", (s.kind, s.title, s.body, s.pattern or None, s.value or None), w=True)
+    i = q("INSERT INTO sources(kind,title,body,pattern,value,ws) VALUES(?,?,?,?,?,?)", (s.kind, s.title, s.body, s.pattern or None, s.value or None, WS(x_token)), w=True)
     log(u, "source_added", f"#{i} {s.kind} {s.title}"); return {"id": i}
 
 
 @app.post("/api/sources/{sid}/toggle")
 def toggle(sid: int, x_token: str = Header("")):
-    u = need(x_token, "manager")
+    u = need(x_token, "manager"); own("sources", sid, WS(x_token))
     q("UPDATE sources SET active=1-active, version=version+1 WHERE id=?", (sid,), w=True)
     log(u, "source_toggled", str(sid)); return {"ok": True}
 
@@ -475,7 +526,7 @@ def toggle(sid: int, x_token: str = Header("")):
 def contents(x_token: str = Header("")):
     u, r = who(x_token)
     rows = q("""SELECT c.id,c.title,c.author,v.id vid,v.n,v.status FROM contents c JOIN versions v
-                ON v.id=(SELECT MAX(id) FROM versions WHERE content_id=c.id) ORDER BY c.id DESC""")
+                ON v.id=(SELECT MAX(id) FROM versions WHERE content_id=c.id) WHERE c.ws=? ORDER BY c.id DESC""", (WS(x_token),))
     return [x for x in rows if r == "manager" and x["status"] != "draft" or x["author"] == u or (r != "creator" and x["status"] != "draft")]
 
 
@@ -483,7 +534,7 @@ def contents(x_token: str = Header("")):
 def new_content(b: New, x_token: str = Header("")):
     u = need(x_token, "creator", "manager")
     if not b.text.strip(): raise HTTPException(400, "Empty draft")
-    cid = q("INSERT INTO contents(title,purpose,author) VALUES(?,?,?)", (b.title or "Untitled", b.purpose, u), w=True)
+    cid = q("INSERT INTO contents(title,purpose,author,ws) VALUES(?,?,?,?)", (b.title or "Untitled", b.purpose, u, WS(x_token)), w=True)
     vid = q("INSERT INTO versions(content_id,n,text,author) VALUES(?,1,?,?)", (cid, b.text, u), w=True)
     run(vid, b.text); log(u, "content_created", f"v{vid}"); return {"vid": vid}
 
@@ -492,24 +543,24 @@ def latest(v):
     return q("SELECT id,n FROM versions WHERE content_id=? ORDER BY n DESC LIMIT 1", (v["content_id"],), one=True)
 
 
-def ver(vid):
-    v = q("SELECT v.*,c.title,c.purpose,c.author cauthor FROM versions v JOIN contents c ON c.id=v.content_id WHERE v.id=?", (vid,), one=True)
+def ver(vid, ws):
+    v = q("SELECT v.*,c.title,c.purpose,c.author cauthor FROM versions v JOIN contents c ON c.id=v.content_id WHERE v.id=? AND c.ws=?", (vid, ws), one=True)
     if not v: raise HTTPException(404, "Not found")
     return v
 
 
 @app.get("/api/versions/{vid}")
 def get_version(vid: int, x_token: str = Header("")):
-    who(x_token); v = ver(vid); lt = latest(v)
+    who(x_token); v = ver(vid, WS(x_token)); lt = latest(v)
     return {"version": v, "latest": lt["id"] == vid, "latest_id": lt["id"], "latest_n": lt["n"], "findings": q("SELECT * FROM findings WHERE version_id=?", (vid,)),
             "comments": q("SELECT * FROM comments WHERE version_id=?", (vid,)),
             "history": q("SELECT id,n,status,approved_by FROM versions WHERE content_id=? ORDER BY n", (v["content_id"],)),
-            "src": {s["id"]: s["title"] for s in q("SELECT id,title FROM sources")}}
+            "src": {s["id"]: s["title"] for s in q("SELECT id,title FROM sources WHERE ws=?", (WS(x_token),))}}
 
 
 @app.post("/api/versions/{vid}/revise")
 def revise(vid: int, b: Txt, x_token: str = Header("")):
-    u = need(x_token, "creator", "manager"); v = ver(vid)
+    u = need(x_token, "creator", "manager"); v = ver(vid, WS(x_token))
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can revise")
     lt = latest(v)
     if lt["id"] != vid: raise HTTPException(409, f"A newer version (v{lt['n']}) exists. Open the latest version to edit.")
@@ -522,7 +573,9 @@ def revise(vid: int, b: Txt, x_token: str = Header("")):
 @app.post("/api/findings/{fid}/decide")
 def decide(fid: int, b: Dec, x_token: str = Header("")):
     u = need(x_token, "creator", "manager")
-    f = q("SELECT * FROM findings WHERE id=?", (fid,), one=True); v = ver(f["version_id"])
+    f = q("SELECT * FROM findings WHERE id=?", (fid,), one=True)
+    if not f: raise HTTPException(404, "Not found")
+    v = ver(f["version_id"], WS(x_token))
     if v["cauthor"] != u or v["status"] not in ("draft", "changes_requested"): raise HTTPException(403, "Not allowed on this version")
     if latest(v)["id"] != v["id"]: raise HTTPException(409, "This is an older version; respond on the latest version.")
     if b.decision not in ("accept", "reject", "dispute"): raise HTTPException(400, "Bad decision")
@@ -533,7 +586,7 @@ def decide(fid: int, b: Dec, x_token: str = Header("")):
 
 @app.post("/api/versions/{vid}/submit")
 def submit(vid: int, x_token: str = Header("")):
-    u = need(x_token, "creator", "manager"); v = ver(vid)
+    u = need(x_token, "creator", "manager"); v = ver(vid, WS(x_token))
     if v["cauthor"] != u: raise HTTPException(403, "Only the author can submit")
     if latest(v)["id"] != vid: raise HTTPException(409, "Only the latest version can be submitted.")
     n = sum(1 for f in q("SELECT state,decision FROM findings WHERE version_id=?", (vid,)) if f["decision"] == "open" and f["state"] != "suggestion")
@@ -543,13 +596,13 @@ def submit(vid: int, x_token: str = Header("")):
 
 @app.post("/api/versions/{vid}/comment")
 def comment(vid: int, b: Cm, x_token: str = Header("")):
-    u, _ = who(x_token); ver(vid)
+    u, _ = who(x_token); ver(vid, WS(x_token))
     q("INSERT INTO comments(version_id,who,text) VALUES(?,?,?)", (vid, u, b.text), w=True); return {"ok": True}
 
 
 @app.post("/api/versions/{vid}/approve")
 def approve(vid: int, b: Ap, x_token: str = Header("")):
-    u = need(x_token, "reviewer", "manager"); v = ver(vid)
+    u = need(x_token, "reviewer", "manager"); v = ver(vid, WS(x_token))
     if v["status"] != "in_review": raise HTTPException(400, "Version is not awaiting review")
     if u == v["cauthor"]: raise HTTPException(403, "Self-approval is not allowed")
     fs = q("SELECT * FROM findings WHERE version_id=?", (vid,))
@@ -564,15 +617,16 @@ def approve(vid: int, b: Ap, x_token: str = Header("")):
 
 @app.get("/api/insights")
 def insights(x_token: str = Header("")):
-    who(x_token)
-    return {"by_rule": q("SELECT rule,COUNT(*) n FROM findings GROUP BY rule ORDER BY n DESC"),
-            "disputed": q("SELECT f.rule,s.title source,COUNT(*) n FROM findings f LEFT JOIN sources s ON s.id=f.source_id WHERE f.decision IN('dispute','reject') GROUP BY f.rule,f.source_id ORDER BY n DESC"),
-            "audit": q("SELECT ts,who,action,detail FROM audit ORDER BY id DESC LIMIT 15")}
+    ws = WS(x_token)
+    j = "FROM findings f JOIN versions v ON v.id=f.version_id JOIN contents c ON c.id=v.content_id"
+    return {"by_rule": q("SELECT f.rule,COUNT(*) n " + j + " WHERE c.ws=? GROUP BY f.rule ORDER BY n DESC", (ws,)),
+            "disputed": q("SELECT f.rule,s.title source,COUNT(*) n " + j + " LEFT JOIN sources s ON s.id=f.source_id WHERE c.ws=? AND f.decision IN('dispute','reject') GROUP BY f.rule,f.source_id,s.title ORDER BY n DESC", (ws,)),
+            "audit": q("SELECT ts,who,action,detail FROM audit WHERE ws=? ORDER BY id DESC LIMIT 15", (ws,))}
 
 
 @app.get("/api/versions/{vid}/diff")
 def diff(vid: int, x_token: str = Header("")):
-    who(x_token); v = ver(vid)
+    who(x_token); v = ver(vid, WS(x_token))
     p = q("SELECT text,n FROM versions WHERE content_id=? AND n=?", (v["content_id"], v["n"] - 1), one=True)
     if not p: return {"ops": [], "prev": None}
     a, b = p["text"].split(), v["text"].split(); ops = []
@@ -586,7 +640,7 @@ def diff(vid: int, x_token: str = Header("")):
 
 @app.get("/api/versions/{vid}/record")
 def record(vid: int, x_token: str = Header("")):
-    who(x_token); v = ver(vid)
+    who(x_token); v = ver(vid, WS(x_token))
     return {"title": v["title"], "version": v["n"], "status": v["status"], "author": v["cauthor"], "approved_by": v["approved_by"],
             "note": v["note"], "ai_layer": v["ai"], "text": v["text"],
             "findings": q("SELECT rule,state,span,message,source_id,source_version,decision,reason FROM findings WHERE version_id=?", (vid,)),
@@ -663,7 +717,7 @@ EVAL = [  # labels were written from the written rules BEFORE running the engine
 def evaluate(x_token: str = Header("")):
     who(x_token); rows = []; tp = fp = fn = sc = sk = cfp = 0
     for group, text, exp, sup in EVAL:
-        res = assess(review(text, use_ai=False)[0])
+        res = assess(review(text, use_ai=False, ws=DEMO_WS)[0])
         found = {(f["rule"], f["state"]) for f in res}
         tp += len(found & exp); fp += len(found - exp); fn += len(exp - found)
         if group == C and found: cfp += 1
@@ -675,7 +729,7 @@ def evaluate(x_token: str = Header("")):
     return {"cases": rows, "total": len(rows), "correct": sum(r["ok"] for r in rows), "groups": {g: sum(1 for e in EVAL if e[0] == g) for g in (C, S, U)},
             "precision": round(tp / (tp + fp), 2) if tp + fp else 1.0, "recall": round(tp / (tp + fn), 2) if tp + fn else 1.0,
             "clean_false_positives": cfp, "support_checked": sk, "support_correct": sc,
-            "note": "30 fictional drafts (10 clean, 10 seeded errors, 10 unsupported or ambiguous claims) run through the rule engine with AI off against the active source library. Labels were written before running. Small, developer-written set: it shows where the engine is reliable and where it is not, not real-world accuracy. Misses are listed, not hidden."}
+            "note": "30 fictional drafts (10 clean, 10 seeded errors, 10 unsupported or ambiguous claims) run through the rule engine with AI off against the NovaDesk demo workspace library. Labels were written before running. Small, developer-written set: it shows where the engine is reliable and where it is not, not real-world accuracy. Misses are listed, not hidden."}
 
 
 # ---------------- UI ----------------
@@ -712,11 +766,12 @@ const SAMPLE2='Subject: Big news!\nHi team, NovaDesk is the best and fastest hel
 const SAMPLE='Meet Nova Desk! Nova Desk starts at INR 299/month and every customer is guaranteed to double revenue in 7 days.\n\n![](hero.png)\n[text:#999999 on:#ffffff] Limited offer\n[colors: #FF00FF, #2F6FED]';
 async function boot(){INFO=await (await fetch('/api/info')).json();
 $('#ft').textContent=INFO.ai=='on'?`AI disclosure: tone/messaging analysis sends draft text (emails and phone numbers masked) and guideline text to Anthropic (${INFO.model}). Exact checks run locally. AI findings are suggestions; humans decide.`:'AI disclosure: AI layer is OFF. All checks currently run locally with deterministic rules. Humans decide.';
+$('#ft').textContent+=' Storage: '+(INFO.db=='postgresql'?'PostgreSQL (persistent).':'SQLite (demo data resets when the host restarts).');
 if(!TOKEN)return loginView();try{await start()}catch(e){}}
-async function start(){ME=await api('/me');$('#who').innerHTML=`${esc(ME.name)} (${ME.role}) <button onclick="logout()">Sign out</button>`;
+async function start(){ME=await api('/me');$('#who').innerHTML=`${esc(ME.name)} (${ME.role}) &middot; ${esc(ME.workspace||'')} <button onclick="logout()">Sign out</button>`;
 $('#nav').innerHTML=[['c','Content'],['s','Sources'],['i','Insights'],['e','Evaluation']].map(([k,t])=>`<button id="t${k}" onclick="tab('${k}')">${t}</button>`).join('');CUR=null;tab('c')}
 function loginView(){ME=null;$('#nav').innerHTML='';$('#who').innerHTML='';
-$('#m').innerHTML=`<div class="card" style="max-width:520px;margin:20px auto"><h3>Sign in to BrandLess</h3><input id="lu" placeholder="Username" autocomplete="username"><input id="lp" type="password" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key=='Enter')login()"><button onclick="login()">Sign in</button>${(INFO.demo||[]).length?`<p class="mut"><b>Demo accounts</b> (fictional data only). Click a row to fill it in. Creator drafts and responds; Manager manages sources; Reviewer approves.</p><table><tr><th>Username</th><th>Password</th><th>Role</th></tr>${INFO.demo.map(d=>`<tr style="cursor:pointer" onclick="$('#lu').value='${esc(d.username)}';$('#lp').value='${esc(d.password)}'"><td>${esc(d.username)}</td><td>${esc(d.password)}</td><td>${esc(d.role)}</td></tr>`).join('')}</table>`:''}</div>`}
+$('#m').innerHTML=`<div class="card" style="max-width:520px;margin:20px auto"><h3>Sign in to BrandLess</h3><input id="lu" placeholder="Username" autocomplete="username"><input id="lp" type="password" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key=='Enter')login()"><button onclick="login()">Sign in</button>${(INFO.demo||[]).length?`<p class="mut"><b>Demo accounts</b> (fictional data only). Click a row to fill it in. Creator drafts and responds; Manager manages sources; Reviewer approves. Each workspace is isolated: its own sources, drafts and audit trail.</p><table><tr><th>Username</th><th>Password</th><th>Role</th><th>Workspace</th></tr>${INFO.demo.map(d=>`<tr style="cursor:pointer" onclick="$('#lu').value='${esc(d.username)}';$('#lp').value='${esc(d.password)}'"><td>${esc(d.username)}</td><td>${esc(d.password)}</td><td>${esc(d.role)}</td><td>${esc(d.workspace||'')}</td></tr>`).join('')}</table>`:''}</div>`}
 async function login(){let r;try{r=await api('/login','POST',{username:$('#lu').value,password:$('#lp').value})}catch(e){return}TOKEN=r.token;localStorage.t=TOKEN;try{await start()}catch(e){}}
 async function logout(){try{await api('/logout','POST')}catch(e){}TOKEN='';localStorage.removeItem('t');loginView()}
 const SAMPLEG='Brand voice: Use "NovaDesk" instead of "Nova Desk". Never use "Novadesk".\nThe starting price is INR 599 per month. Annual plans are INR 499 per month.\nOur colours are #1F2A44, #2F6FED and #FFFFFF.\nAlways keep a professional and friendly tone.\nYou must not promise guaranteed results.';

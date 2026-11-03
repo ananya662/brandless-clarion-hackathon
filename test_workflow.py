@@ -12,6 +12,8 @@ DRAFT1 = "NovaDesk starts at INR 299/month and guarantees 2x revenue in 7 days."
 @pytest.fixture()
 def c(tmp_path):
     main.DB = str(tmp_path / "t.db")
+    if main.PG:  # real PostgreSQL run: start every test from an empty schema
+        main.q("DROP SCHEMA public CASCADE", w=True); main.q("CREATE SCHEMA public", w=True)
     with TestClient(main.app) as cl:
         for h, u in ((A, "asha"), (M, "manoj"), (R, "rina")):
             h["X-Token"] = cl.post("/api/login", json={"username": u, "password": "demo123"}).json()["token"]
@@ -254,3 +256,44 @@ def test_accept_clean_only_activates_unflagged_complete_rules(c):
 def test_import_pattern_matches_seeded_price_pattern(c):
     seeded = next(s for s in c.get("/api/sources", headers=M).json() if s["kind"] == "fact")["pattern"]
     assert main.INR_PAT == seeded
+
+
+def acme(c, u):
+    return {"X-Token": c.post("/api/login", json={"username": u, "password": "demo123"}).json()["token"]}
+
+
+def test_workspaces_are_isolated(c):
+    AM, AC = acme(c, "acme_manager"), acme(c, "acme_creator")
+    v = new(c, DRAFT1); d = det(c, v); cid = d["version"]["content_id"]; fid = d["findings"][0]["id"]; cited = d["findings"][0]["source_id"]
+    c.post("/api/import", json={"name": "g.txt", "text": GUIDE}, headers=M)
+    assert c.get("/api/contents", headers=AM).json() == [] and c.get("/api/contents", headers=AC).json() == []
+    srcs = c.get("/api/sources", headers=AM).json()
+    assert srcs and all(s["ws"] == 2 for s in srcs) and not any(s["title"] == "NovaDesk" for s in srcs)
+    for r in (c.get(f"/api/versions/{v}", headers=AC), c.get(f"/api/versions/{v}/diff", headers=AC), c.get(f"/api/versions/{v}/record", headers=AC),
+              c.post(f"/api/versions/{v}/comment", json={"text": "x"}, headers=AC), c.post(f"/api/versions/{v}/submit", headers=AC),
+              c.post(f"/api/versions/{v}/revise", json={"text": "other"}, headers=AC), c.post(f"/api/findings/{fid}/decide", json={"decision": "accept"}, headers=AC),
+              c.post(f"/api/sources/{cited}/toggle", headers=AM), c.delete(f"/api/sources/{cited}", headers=AM), c.delete(f"/api/contents/{cid}", headers=AM)):
+        assert r.status_code == 404                                              # looks exactly like a missing record
+    assert c.get("/api/proposals", headers=AM).json() == [] and props(c)
+    pid = props(c)[0]["id"]
+    assert c.post(f"/api/proposals/{pid}/accept", json={"title": "x", "body": "y", "value": "z"}, headers=AM).status_code == 404
+    assert c.post(f"/api/proposals/{pid}/reject", headers=AM).status_code == 404
+    assert c.post("/api/proposals/accept-clean", headers=AM).json()["accepted"] == 0
+    assert c.get("/api/insights", headers=AM).json()["by_rule"] == []
+    assert all(e["who"].startswith("acme") for e in c.get("/api/audit/export", headers=AM).json()["events"])
+    assert any(e["who"] == "asha" for e in c.get("/api/audit/export", headers=M).json()["events"])
+
+
+def test_each_workspace_applies_its_own_rules(c):
+    AC = acme(c, "acme_creator"); text = "Try Zefyr at INR 499/month. Meet Nova Desk."
+    ac = {(f["rule"], f["span"]) for f in det(c, c.post("/api/contents", json={"title": "t", "text": text}, headers=AC).json()["vid"], AC)["findings"]}
+    nv = {(f["rule"], f["span"]) for f in det(c, new(c, text))["findings"]}
+    assert ("terminology", "Zefyr") in ac and ("fact", "INR 499") in ac and ("terminology", "Nova Desk") not in ac
+    assert ("terminology", "Nova Desk") in nv and ("terminology", "Zefyr") not in nv and not any(r == "fact" for r, _ in nv)
+    assert c.get("/api/eval", headers=AC).json()["correct"] == c.get("/api/eval", headers=A).json()["correct"]   # evaluation is workspace-independent
+
+
+def test_login_lists_both_demo_workspaces_and_me_reports_workspace(c):
+    info = c.get("/api/info").json()
+    assert {d["workspace"] for d in info["demo"]} == {"NovaDesk demo workspace", "Acme Studio demo workspace"} and info["db"] in ("sqlite", "postgresql")
+    assert c.get("/api/me", headers=acme(c, "acme_manager")).json()["workspace"] == "Acme Studio demo workspace"

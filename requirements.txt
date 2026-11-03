@@ -2,3 +2,4 @@ fastapi
 uvicorn
 pypdf
 pillow
+psycopg2-binary
